@@ -66,18 +66,33 @@ pub async fn restore_to<S: ObjectStore>(
         .await
         .map_err(|source| Error::Io { path: dst.to_path_buf(), source })?;
 
+    // Immutable files, by relative path.
     for id in &record.file_ids {
         let bytes = store.get(&layout.file(id)).await?;
-        let out = dst.join(id.0.as_str());
-        if let Some(parent) = out.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|source| Error::Io { path: parent.to_path_buf(), source })?;
-        }
-        tokio::fs::write(&out, &bytes)
-            .await
-            .map_err(|source| Error::Io { path: out, source })?;
+        write_relative(dst, &id.0, &bytes).await?;
     }
 
+    // Mutable pointer files (each keyspace's `current` HEAD), captured inline in the record.
+    for p in &record.pointers {
+        write_relative(dst, &p.path, &p.bytes).await?;
+    }
+
+    // fjall's recovery acquires the lock file with open (not create), so it must pre-exist. It's a
+    // 0-byte runtime artifact we deliberately don't replicate — recreate an empty one here.
+    write_relative(dst, "lock", b"").await?;
+
     Ok(record)
+}
+
+/// Write `bytes` to `dst/<rel>`, creating parent directories.
+async fn write_relative(dst: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
+    let out = dst.join(rel);
+    if let Some(parent) = out.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| Error::Io { path: parent.to_path_buf(), source })?;
+    }
+    tokio::fs::write(&out, bytes)
+        .await
+        .map_err(|source| Error::Io { path: out, source })
 }

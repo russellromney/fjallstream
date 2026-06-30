@@ -8,6 +8,7 @@
 //! immutable files and copy-on-write versions let us drop everything Litestream built to fight
 //! SQLite's mutable pages.
 
+pub mod capture;
 pub mod error;
 pub mod follower;
 pub mod layout;
@@ -16,7 +17,8 @@ pub mod replicator;
 pub mod restore;
 pub mod types;
 
+pub use capture::{capture, Captured};
 pub use error::{Error, Result};
 pub use object_store::{LocalObjectStore, ObjectStore};
 pub use replicator::{LocalVersion, ReplicateConfig, Replicator};
-pub use types::{Cursor, FileId, Generation, JournalRef, RestoreTarget, VersionRecord};
+pub use types::{Cursor, FileId, Generation, PointerFile, RestoreTarget, VersionRecord};

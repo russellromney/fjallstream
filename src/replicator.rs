@@ -16,10 +16,10 @@
 use crate::error::Result;
 use crate::layout::Layout;
 use crate::object_store::ObjectStore;
-use crate::types::{FileId, JournalRef, VersionRecord};
+use crate::types::{FileId, PointerFile, VersionRecord};
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A point-in-time view of the local database: the immutable file set at `seqno`, captured while a
 /// fjall `Snapshot` is held so the files cannot be GC'd before we upload them.
@@ -32,8 +32,8 @@ pub struct LocalVersion {
     pub parent: Option<u64>,
     /// Every immutable file the database references right now, as `(file id, path on disk)`.
     pub files: Vec<(FileId, PathBuf)>,
-    /// The journal tail past `seqno`, if any, as `(range, bytes)`.
-    pub journal: Option<(JournalRef, Bytes)>,
+    /// The mutable pointer files (each keyspace's `current` HEAD), captured by value.
+    pub pointers: Vec<PointerFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,30 +88,23 @@ impl<S: ObjectStore> Replicator<S> {
             self.store.put(&key, Bytes::from(bytes)).await?;
         }
 
-        // 2. Ship the journal tail, if present.
-        let journal_ref = match &version.journal {
-            Some((jref, bytes)) => {
-                let key = self.layout.journal_segment(jref.from, jref.to);
-                self.store.put(&key, bytes.clone()).await?;
-                Some(jref.clone())
-            }
-            None => None,
-        };
+        // 2. Decide whether this is a forced re-base point.
+        let is_snapshot =
+            matches!(self.cfg.snapshot_every, Some(n) if self.versions_since_snapshot + 1 >= n);
 
-        // 3. Decide whether this is a forced re-base point.
-        let is_snapshot = match self.cfg.snapshot_every {
-            Some(n) if self.versions_since_snapshot + 1 >= n => true,
-            _ => false,
-        };
-
-        // 4. Write the version record last (the commit point).
+        // 3. Write the version record last (the commit point). The mutable pointer files ride
+        //    inline; there is no journal in 0.1 (capture force-flushes first).
+        let ts_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let record = VersionRecord {
             seqno: version.seqno,
             parent: version.parent,
             file_ids: version.files.iter().map(|(id, _)| id.clone()).collect(),
-            journal_ref,
+            pointers: version.pointers.clone(),
             is_snapshot,
-            ts_millis: 0, // TODO: stamp at the call site; scripts/loop must not read the clock here.
+            ts_millis,
         };
         let body = Bytes::from(serde_json::to_vec(&record)?);
         self.store.put(&self.layout.version(version.seqno), body.clone()).await?;

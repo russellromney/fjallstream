@@ -26,19 +26,19 @@ impl std::fmt::Display for FileId {
 
 /// One point in the replicated version history.
 ///
-/// This is the fjall-native analog of a Litestream "transaction unit": the exact set of
-/// immutable files that make up the database at sequence number `seqno`, plus a pointer to the
-/// journal segment that carries any writes past the last flush.
+/// The exact set of immutable files that make up the database at sequence number `seqno`, plus the
+/// bytes of the few *mutable* pointer files (fjall's per-keyspace `current` HEAD) captured inline —
+/// those can't be content-addressed because they're rewritten in place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionRecord {
     /// Monotonic sequence-number watermark this version is flushed up to.
     pub seqno: u64,
     /// The version this one descends from, if any. `None` for the first record in a generation.
     pub parent: Option<u64>,
-    /// Every immutable file the database references at this version.
+    /// Every immutable file the database references at this version (keyed by relative path).
     pub file_ids: Vec<FileId>,
-    /// The journal segment covering writes after `seqno`, if shipped.
-    pub journal_ref: Option<JournalRef>,
+    /// The mutable pointer files (e.g. each keyspace's `current` HEAD), captured inline.
+    pub pointers: Vec<PointerFile>,
     /// True if this record is a full re-base point (a fresh snapshot) rather than an incremental
     /// version. Re-base points let old files GC out of the bucket by breaking dependency chains.
     pub is_snapshot: bool,
@@ -47,11 +47,12 @@ pub struct VersionRecord {
     pub ts_millis: u64,
 }
 
-/// A shipped journal segment, covering the half-open seqno range `[from, to)`.
+/// A mutable file captured by value inside a [`VersionRecord`]. `path` is relative to the database
+/// root (e.g. `keyspaces/1/current`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalRef {
-    pub from: u64,
-    pub to: u64,
+pub struct PointerFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
 }
 
 /// A reader's position in the replication stream. This is a log position, never a per-key seqno

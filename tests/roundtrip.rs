@@ -34,7 +34,7 @@ async fn replicate_then_restore_roundtrip() {
         seqno: 100,
         parent: None,
         files: vec![f_a.clone(), f_b.clone()],
-        journal: None,
+        pointers: vec![],
     };
     assert_eq!(repl.replicate_once(&v1).await.unwrap(), 100);
 
@@ -44,7 +44,7 @@ async fn replicate_then_restore_roundtrip() {
         seqno: 200,
         parent: Some(100),
         files: vec![f_a.clone(), f_c.clone()],
-        journal: None,
+        pointers: vec![],
     };
     assert_eq!(repl.replicate_once(&v2).await.unwrap(), 200);
 
@@ -64,7 +64,7 @@ async fn replicate_then_restore_roundtrip() {
         b"charlie"
     );
     // f_b was not part of version 2, so it must not be restored.
-    assert!(restored.path().join("0002.blob").exists() == false);
+    assert!(!restored.path().join("0002.blob").exists());
 
     // Point-in-time: resolve at seqno 150 should pick version 100.
     let at_150 = resolve_version(&store2, &layout2, &RestoreTarget::Seqno(150))
@@ -83,8 +83,8 @@ async fn immutable_files_upload_once() {
     let mut repl = Replicator::new(store, layout, ReplicateConfig::default());
 
     let f = make_file(src.path(), "same.sst", b"x").await;
-    let v1 = LocalVersion { seqno: 1, parent: None, files: vec![f.clone()], journal: None };
-    let v2 = LocalVersion { seqno: 2, parent: Some(1), files: vec![f.clone()], journal: None };
+    let v1 = LocalVersion { seqno: 1, parent: None, files: vec![f.clone()], pointers: vec![] };
+    let v2 = LocalVersion { seqno: 2, parent: Some(1), files: vec![f.clone()], pointers: vec![] };
     repl.replicate_once(&v1).await.unwrap();
 
     // Mutate the on-disk file after first upload. Because the file id is the same and the store

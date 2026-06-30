@@ -156,10 +156,21 @@ Buildable today against fjall's public API (no upstream changes):
    `current` files become `pointers`, skip `*.jnl` and `lock`.
 4. **Drop snapshot**, then `replicate_once`: upload not-yet-present files, write the version record.
 
-**Restore** lays the `files/` tree back down, writes the inline pointer files and `version`, and
-opens a `Database`. **Cold restore must be proven by opening the restored db and reading keys back**
-— that is the decisive test (PLAN M3), and it also settles the open question of whether fjall opens a
-restored dir with no journal.
+Two things the implementation learned by running it (fjall 3.1.5), both now handled:
+
+- **Capture must be consistent against background compaction.** A held snapshot pins SST *data*, but
+  compaction keeps rewriting the on-disk `v<N>` manifests and the `current` HEAD while we walk. We
+  capture, then re-read every `current`; if none moved, the manifest was stable the whole walk, so
+  each `current` points at a fully-written `v<N>` we captured. If one moved, we retry. (lsm-tree
+  writes a new `v<N>` fully before flipping `current`, which is what makes the check sufficient.)
+- **The `lock` file must exist to recover.** fjall's recovery opens `lock` without creating it, so a
+  restored dir needs one. We don't replicate it (it's a 0-byte runtime artifact); restore recreates
+  an empty one.
+
+**Restore** lays the `files/` tree back down, writes the inline pointer files, recreates an empty
+`lock`, and opens a `Database`. **Proven** (PLAN M3): a real db is captured, replicated, restored into
+a clean dir, opened, and every key reads back equal — including with no journal shipped and the meta
+keyspace (id 0) intact.
 
 ### Deferred (needs upstream fjall work or a bigger lift)
 

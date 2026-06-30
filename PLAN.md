@@ -30,7 +30,16 @@ tests pass against real infrastructure where the test matrix says so.
 - Tests: conformance suite green on Local + Mem always; on S3/Tigris when creds present (see Test
   matrix). Pattern borrowed from hadb's conformance approach.
 
-### M2 — The fjall adapter (the seam) — strategy verified by the spike
+### M2 — The fjall adapter (the seam) — DONE, proven end-to-end
+Built and green: `capture()` (flush → snapshot → walk → consistency-verified), `FileId` is now a
+relative path, `VersionRecord` carries inline `pointers`, restore recreates the `lock` file, and the
+decisive M3 round-trip (write → capture → replicate → restore → **open → read every key back**) passes
+against real fjall 3.1.5 — no journal shipped, meta keyspace intact. Two findings folded in: capture
+retries if compaction moves `current` mid-walk; restore must recreate the `lock` file (fjall opens it
+without creating). Still TODO at this layer: a *stress* test that captures under continuous concurrent
+writes/compaction (the consistency guard exists but isn't yet hammered).
+
+Original plan (for reference):
 - `capture(db, db_path, keyspaces) -> LocalVersion` (see DESIGN.md "Capture strategy"):
   1. `rotate_memtable_and_wait()` on each keyspace (force committed data into SSTs);
   2. `db.snapshot()` (pin GC), record `db.visible_seqno()`;
