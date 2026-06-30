@@ -21,7 +21,7 @@ pub mod types;
 
 pub use capture::{capture, Captured};
 pub use error::{Error, Result};
-pub use follower::{FollowConfig, Follower};
+pub use follower::{FollowConfig, Follower, ReadHandle};
 pub use object_store::{LocalObjectStore, MemObjectStore, ObjectStore};
 pub use replicator::{LocalVersion, ReplicateConfig, Replicator};
 pub use types::{FileId, Generation, PointerFile, RestoreTarget, VersionRecord};

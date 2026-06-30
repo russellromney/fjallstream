@@ -33,8 +33,16 @@ build and test plan.
 
 ## Status
 
-Early, and not yet usable. The core (uploading files, writing records, restoring) works and is
-tested; the part that talks to a live fjall database is being built next. Not published yet.
+A strong prototype / local-0.1 core, not yet production-grade. Capture → replicate → restore (cold,
+point-in-time) and a basic local-copy follower all work against real fjall, with a substantial test
+suite (crash, corruption, concurrent-write consistency, property/model checking, prune, conformance).
+Not published yet, and **no S3 backend yet** (local filesystem only).
+
+The one architectural caveat: capture currently derives a consistent file set from *outside* fjall (by
+walking the directory with stability guards). fjall v3 already has the internal machinery to produce a
+cross-keyspace-consistent snapshot; the right next step is an upstream fjall checkpoint API that
+fjallstream consumes instead. Until then, treat this as a prototype. See [DESIGN.md](./DESIGN.md) "The
+capture boundary" and [docs/UPSTREAM_CHECKPOINT.md](./docs/UPSTREAM_CHECKPOINT.md).
 
 ## License
 

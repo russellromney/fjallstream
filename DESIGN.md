@@ -71,7 +71,7 @@ Every version is already an incremental delta: copy-on-write versions share file
 version records overlap heavily. We force a fresh full snapshot only to prune dependency chains and
 let old files GC out of the bucket — not because we need a consistency base.
 
-## Cursor / position and RPO
+## Replication position and RPO
 
 The replication position is the **version sequence number** — a log position, **never** the per-key
 seqno read out of a file (fjall 3 rewrites per-key seqnos to 0 during bottom-level compaction, so
@@ -143,9 +143,12 @@ flat set of files:
       tables/<table-id>         # SST table files, named by id (immutable, id never reused)
 ```
 
-This is the consistency boundary: a fjallstream "version" is the whole `keyspaces/` tree + the
-top-level `version` file at one point in time. **All keyspaces replicate together** (a restore is
-consistent across every keyspace in the database).
+A fjallstream "version" is the whole `keyspaces/` tree + the top-level `version` file, captured
+together under one snapshot. Restore is **per-keyspace crash-consistent**. It is **not** a
+cross-keyspace *transactional* cut in 0.1 (see "Consistency guarantees" and "The capture boundary"):
+flushing keyspaces sequentially from outside fjall can tear a transaction that spans keyspaces. A
+single consistent cut across keyspaces is exactly what fjall v3's internal snapshot gives, and is
+resolved when capture consumes the upstream checkpoint API.
 
 ### File taxonomy (what goes where)
 
@@ -179,7 +182,8 @@ concept — `prune` just keeps the newest N records and deletes files no retaine
 Buildable today against fjall's public API (no upstream changes):
 
 1. **Force flush** — `rotate_memtable_and_wait()` on each keyspace so committed data is in SSTs.
-2. **Pin** — `db.snapshot()`; record `db.visible_seqno()` as the version seqno.
+2. **Pin** — `db.snapshot()`. Record `db.seqno()` (the next sequence number, read *after* the journal
+   is captured) as the version seqno: an honest upper bound on everything the version contains.
 3. **Walk** — collect every file under the db dir; immutable ones become `file_ids` (relpath),
    `current` files become inline `pointers`, `*.jnl` become per-version `journals`, skip `lock`.
 4. **Drop snapshot**, then `replicate_once`: upload not-yet-present files + journals, write the record.
@@ -201,21 +205,50 @@ Four things the implementation learned by running it (fjall 3.1.5), all now hand
   `visible_seqno`) see nothing, and new writes collide on low seqnos. Fix: ship the journal per-version,
   gzip-compressed.
 - **The journal must be captured consistently, or restore fails with EINVAL.** The same oracle, run
-  repeatedly, flaked ~37%: background journal maintenance truncates/rotates a journal between when the
-  walk records its path and when we read its bytes, shipping a torn journal that recovery rejects. The
-  snapshot pins SSTs, not journals. Fix: read journal bytes *inside* the consistency window, bracketed
-  by length checks, and confirm the `*.jnl` set is unchanged; retry if anything moved. Ship those exact
-  bytes (no late read).
+  repeatedly, flaked ~37%: a journal *rotation* (a sealed journal deleted + a new one created) raced
+  the walk, shipping a torn journal that recovery rejects. The snapshot pins SSTs, not journals. Fix:
+  read journal bytes *inside* the consistency window and confirm the `*.jnl` **set** is unchanged
+  (this is what catches rotation); ship those exact bytes. We deliberately do *not* reject a single
+  mid-write read — a concurrent write only appends, and a half-written final frame is a valid prefix
+  fjall recovery tolerates (a "did the bytes change between two reads" check rejects every append and
+  makes capture fail under load — we tried it; it broke the stress test). The residual risk is reading
+  during an in-place truncation; the real fix is an upstream journal lock — see "The capture boundary".
 
 **Restore** lays the `files/` tree back down, writes the inline pointer files, the per-version
 journals, recreates an empty `lock`, and opens a `Database`. **Proven**: a real db is captured,
 replicated, restored into a clean dir, opened, and every key reads back equal — via both point gets
 *and* iteration (`len()`), with the meta keyspace (id 0) intact.
 
+## The capture boundary (and where it should go)
+
+This is the project's one big open architectural question, and it's deliberate.
+
+Today, `capture` derives a consistent file set from **outside** fjall: flush, hold a snapshot, walk
+the directory, and check `current` / keyspace-set / journal stability with retries. It is clever and
+test-backed, but it sits *outside fjall's synchronization boundary* — so the journal guard above can
+only ever be best-effort, never a true lock.
+
+fjall v3 already has the right primitive internally: it can take a consistent snapshot across
+keyspaces even while compactions and writes are running. The intended checkpoint implementation is
+physical and explicit: briefly lock the journal, fsync/copy the journal, copy or hard-link the
+immutable LSM files, and protect the meta keyspace from mutation during the backup.
+
+So the right long-term shape is: **fjallstream consumes an authoritative fjall checkpoint file-set API
+(or helps build one upstream), instead of inferring consistency from on-disk layout.** Something like
+`Database::checkpoint_manifest()` / `Database::with_checkpoint(|files| …)` that returns the exact
+files + journal + pointers for a cross-keyspace-consistent cut. fjallstream uploads *that*, then writes
+its version record.
+
+The current filesystem-walk capture should be treated as a **prototype / compatibility path, not the
+foundation.** It's cheap to swap: the whole seam is isolated behind [`LocalVersion`] — the replicator,
+restore, and follower never touch fjall — so replacing capture with a checkpoint-API consumer changes
+only `capture.rs`. That swap is the #1 roadmap item.
+
 ### Deferred (needs upstream fjall work or a bigger lift)
 
+- **Upstream capture primitive** (the item above): a fjall checkpoint/file-set API with a journal lock,
+  which fjallstream consumes instead of the filesystem walk. Everything else here is downstream of it.
 - Journal-tail streaming for sub-flush RPO (needs partial-journal replay-to-seqno; not in public API).
-- A version-change hook to replace the polling capture loop.
 - VFS / lazy-block follower: open read-only against a remote block source + cache instead of a full
   local copy (Litestream v0.5's VFS read replica). Or adopt SlateDB, which is built for this.
 
@@ -223,8 +256,8 @@ replicated, restored into a clean dir, opened, and every key reads back equal �
 
 - `object_store` — the `ObjectStore` trait + a `LocalObjectStore` for tests/dev. Only thing that
   changes per backend.
-- `types` — `Generation`, `VersionRecord` (carries `file_paths` + inline `pointers`), `FileId` (a
-  relative path inside the db), `Cursor`.
+- `types` — `Generation`, `VersionRecord` (file ids + checksums + inline `pointers` + journals),
+  `FileId` (a relative path inside the db), `PointerFile`, `RestoreTarget`.
 - `layout` — bucket key construction.
 - `capture` — the fjall seam: flush + snapshot + walk → `LocalVersion`. Verified against fjall 3.1.5.
 - `replicator` — the writer loop.

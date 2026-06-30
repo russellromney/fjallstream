@@ -11,6 +11,14 @@
 //!
 //! The returned [`Captured`] holds the snapshot, so GC stays pinned until the caller has finished
 //! uploading and drops it.
+//!
+//! **Boundary note.** This capture derives a consistent file set from *outside* fjall — flush, hold a
+//! snapshot, walk the directory, and check `current`/keyspace-set/journal stability with retries.
+//! fjall v3 already takes cross-keyspace-consistent snapshots internally even under writes and
+//! compaction, so the right long-term primitive is an upstream checkpoint API that locks the journal
+//! and exposes the exact file set — and fjallstream should *consume* that
+//! rather than infer it from disk. The whole seam is isolated behind [`LocalVersion`]: the replicator
+//! never sees fjall, so swapping this for a checkpoint API touches only this module. See ROADMAP.
 
 use crate::error::{Error, Result};
 use crate::replicator::LocalVersion;
@@ -104,11 +112,21 @@ pub fn capture(
     )))
 }
 
-/// Read the journal files consistently, returning `None` (retry) if any raced background
-/// maintenance. Journals aren't pinned by the snapshot and are truncated/rotated when a flush's
-/// entries are reclaimed, so we read each one bracketed by length checks and confirm the set of
-/// `*.jnl` files in the db root is exactly what we captured. A torn journal makes recovery fail with
-/// EINVAL, so this must be airtight.
+/// Read the journal files, returning `None` (retry) if the set of journals changed — i.e. a rotation
+/// (a sealed journal deleted, a new one created) raced us. That rotation was the actual cause of the
+/// torn-journal EINVAL flake, and the set check is what fixes it.
+///
+/// **This is a best-effort external guard, not a real lock**, and it deliberately does *not* try to
+/// reject a single mid-write read:
+/// - A concurrent write only *appends* to the preallocated journal; a read that catches a half-written
+///   final frame is a valid prefix — fjall recovery stops at the first invalid frame and tolerates it.
+/// - So a "the bytes changed between two reads" check is wrong: under any write load the journal is
+///   always being appended to, two reads always differ, and capture would never succeed (it did exactly
+///   that and broke `tests/stress.rs`).
+/// The residual risk is reading exactly during an in-place *truncation* (maintenance reclaiming flushed
+/// entries), which a length check can't see (the journal is a fixed 64 MiB). The correct fix for that
+/// is an upstream journal lock / checkpoint API — this seam lives outside fjall's synchronization
+/// boundary by necessity today. See ROADMAP "upstream capture primitive".
 fn read_journals_stable(db_path: &Path, journals: &[NamedPath]) -> Result<Option<Vec<NamedBytes>>> {
     // The set of journal files must match what the walk saw (no rotation added/removed one).
     let mut on_disk = std::collections::BTreeSet::new();
@@ -127,27 +145,11 @@ fn read_journals_stable(db_path: &Path, journals: &[NamedPath]) -> Result<Option
 
     let mut out = Vec::with_capacity(journals.len());
     for (name, path) in journals {
-        let len_before = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
+        match std::fs::read(path) {
+            Ok(bytes) => out.push((name.clone(), bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(Error::Io { path: path.clone(), source }),
-        };
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(Error::Io { path: path.clone(), source }),
-        };
-        let len_after = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(Error::Io { path: path.clone(), source }),
-        };
-        // If the file's length moved across the read (truncation/rotation in flight), the bytes may
-        // be torn — retry.
-        if len_before != len_after || bytes.len() as u64 != len_after {
-            return Ok(None);
         }
-        out.push((name.clone(), bytes));
     }
     Ok(Some(out))
 }

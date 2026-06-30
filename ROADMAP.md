@@ -4,6 +4,31 @@ Post-0.1-core work, deferred deliberately. The 0.1 core (capture → replicate �
 backend) and its correctness fixes land first (see `PLAN.md`). These are the items we chose *not* to
 solve in the local path, with the reason. Each tag (C#/P#) maps to a bugaboo from the design review.
 
+## #1 — Move the capture seam into fjall (upstream checkpoint primitive)
+
+The single most important next step, and an architectural one. Today `capture` infers a consistent
+file set from *outside* fjall (flush → snapshot → directory walk → `current`/keyspace/journal
+stability retries). That works and is test-backed, but it lives outside fjall's synchronization
+boundary, so the journal guard can only be best-effort — never a real lock.
+
+fjall v3 already takes cross-keyspace-consistent snapshots internally even under writes/compaction.
+The right shape is an upstream **checkpoint / file-set API** — briefly lock the journal, fsync/copy
+it, expose the immutable LSM files + meta + pointers for the consistent cut — which fjallstream
+*consumes* instead of inferring from disk.
+
+- Contribute or track upstream: `Database::checkpoint_manifest()` / `Database::with_checkpoint(|fs| …)`.
+- Then `capture` becomes "ask fjall for the checkpoint file set, upload exactly that, write the version
+  record." It's a contained swap: the seam is already isolated behind `LocalVersion` (replicator,
+  restore, follower never touch fjall), so only `capture.rs` changes.
+- Keep the filesystem-walk capture as a prototype / compatibility path, not the foundation.
+- **Subsumes C4 (cross-keyspace consistent cut).** 0.1 is per-keyspace crash-consistent only;
+  sequential flush + external file capture can tear a transaction spanning keyspaces. A true single
+  cut is exactly what fjall's internal snapshot provides — so this is *resolved only when capture
+  consumes the checkpoint API*, not as a separate piece of work.
+
+Until this lands, treat fjallstream as a strong prototype / local-0.1 core, not production-grade
+durable software. See DESIGN.md "The capture boundary".
+
 ## Done since the review
 
 - **C5 — `ObjectStore::list` contract.** Resolved: `list` is now recursive (flat keys) on both Local
@@ -37,10 +62,6 @@ These only matter once a high-latency, network backend exists. Build them in the
 
 Not S3-specific, but bigger than the 0.1 core or blocked on a fjall API we don't have.
 
-- **C4 — Cross-keyspace consistent cut.** 0.1 guarantees per-keyspace crash-consistency only;
-  sequential per-keyspace flush + file capture can tear a cross-keyspace transaction. A true single
-  cut needs either atomic multi-keyspace flush or capturing through the snapshot's view (no public
-  file-set-for-snapshot API). Revisit when tx-spanning backups matter.
 - **P3 — Skip flush when clean.** Capture force-flushes every interval, creating L0 SSTs even when
   nothing changed. Skip the `rotate_memtable_and_wait` when the active memtable is empty — needs a
   public dirty/size check. (0.1 makes flush configurable and documents interval guidance.)

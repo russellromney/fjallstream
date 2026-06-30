@@ -39,11 +39,14 @@ async fn follower_catches_up_and_serves_reads() {
 
     // First catch-up: follower advances and can read batch A.
     assert!(follower.poll_once().await.unwrap(), "follower should advance to version A");
+    assert_eq!(follower.applied_seqno(), Some(sa));
+
+    // Hold a read handle over version A *across* the next swap. Its directory must survive.
+    let held_a = follower.read().expect("follower has a db");
     {
-        let fdb = follower.database().expect("follower has a db");
-        let fks = fdb.keyspace("data", KeyspaceCreateOptions::default).unwrap();
-        assert_eq!(fks.len().unwrap(), 500, "follower must see all of A (via iteration)");
-        assert_eq!(fks.get("a-00042").unwrap().as_deref(), Some(b"av-00042".as_ref()));
+        let ks_a = held_a.keyspace("data", KeyspaceCreateOptions::default).unwrap();
+        assert_eq!(ks_a.len().unwrap(), 500, "follower must see all of A (via iteration)");
+        assert_eq!(ks_a.get("a-00042").unwrap().as_deref(), Some(b"av-00042".as_ref()));
     }
 
     // No new version => no advance.
@@ -59,8 +62,14 @@ async fn follower_catches_up_and_serves_reads() {
 
     // Second catch-up: follower advances and now sees A+B.
     assert!(follower.poll_once().await.unwrap(), "follower should advance to version B");
-    let fdb = follower.database().expect("follower has a db");
-    let fks = fdb.keyspace("data", KeyspaceCreateOptions::default).unwrap();
-    assert_eq!(fks.len().unwrap(), 1000, "follower must see A+B");
-    assert_eq!(fks.get("b-00007").unwrap().as_deref(), Some(b"bv-00007".as_ref()));
+    let fresh = follower.read().expect("follower has a db");
+    let ks_b = fresh.keyspace("data", KeyspaceCreateOptions::default).unwrap();
+    assert_eq!(ks_b.len().unwrap(), 1000, "follower must see A+B");
+    assert_eq!(ks_b.get("b-00007").unwrap().as_deref(), Some(b"bv-00007".as_ref()));
+
+    // The handle we grabbed at version A is STILL readable after the swap — its directory wasn't
+    // deleted underneath it (refcounted DirHandle).
+    let ks_still_a = held_a.keyspace("data", KeyspaceCreateOptions::default).unwrap();
+    assert_eq!(ks_still_a.len().unwrap(), 500, "held read of A must survive the swap to B");
+    assert_eq!(ks_still_a.get("a-00042").unwrap().as_deref(), Some(b"av-00042".as_ref()));
 }
