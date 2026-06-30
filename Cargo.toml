@@ -1,0 +1,21 @@
+[package]
+name = "fjallstream"
+version = "0.0.0"
+edition = "2021"
+description = "Async replication and point-in-time backup for fjall, to object storage."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/russellromney/fjallstream"
+
+[dependencies]
+fjall = "3"
+tokio = { version = "1", features = ["fs", "rt", "macros", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+bytes = "1"
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
