@@ -18,6 +18,9 @@ tests pass against real infrastructure where the test matrix says so.
 - `Replicator::replicate_once` (file dedup + version record), `restore::{resolve_version,
   restore_to}`.
 - Tests: layout ordering; replicate→resolve→restore round-trip; immutable-upload-once (tamper test).
+- **Spike done** (`examples/spike_layout.rs`, fjall 3.1.5): learned the real on-disk layout, confirmed
+  `Snapshot` pins GC, and found `rotate_memtable_and_wait()` for force-flush. See DESIGN.md "fjall
+  on-disk layout". This resolves what was the project's biggest unknown (consistent capture).
 
 ### M1 — Object store: conformance + real backends
 - `MemObjectStore` (in-memory, for fast tests).
@@ -27,17 +30,21 @@ tests pass against real infrastructure where the test matrix says so.
 - Tests: conformance suite green on Local + Mem always; on S3/Tigris when creds present (see Test
   matrix). Pattern borrowed from hadb's conformance approach.
 
-### M2 — The fjall adapter (the seam)
-- `FjallSource`: open/wrap a `fjall::Database`, and capture a `LocalVersion`:
-  hold a `Snapshot` (pins GC), enumerate the on-disk immutable files, read the current seqno
-  watermark, and read the journal tail past the last flush.
-- Pin down the exact fjall 3.1.x API for: directory layout + file naming, current seqno / instant,
-  `Snapshot` lifetime, journal location.
-- Tests (real fjall):
-  - capture reflects what's on disk (write keys → capture → file set + seqno match);
-  - **snapshot pins GC**: write, capture (hold snapshot), force flush+compaction, assert the
-    captured files still exist on disk until the snapshot drops;
-  - journal tail captures writes made after the last flush.
+### M2 — The fjall adapter (the seam) — strategy verified by the spike
+- `capture(db, db_path, keyspaces) -> LocalVersion` (see DESIGN.md "Capture strategy"):
+  1. `rotate_memtable_and_wait()` on each keyspace (force committed data into SSTs);
+  2. `db.snapshot()` (pin GC), record `db.visible_seqno()`;
+  3. walk the db dir: immutable files → `file_paths` (relative-path ids); `current` HEAD files →
+     inline `pointers`; skip `*.jnl` and `lock`;
+  4. drop the snapshot.
+- Code changes this enables: `FileId` becomes a **relative path**; `VersionRecord` gains a
+  `pointers: Vec<(String, Bytes)>` field; the writer stamps `ts_millis` at capture.
+- Tests (real fjall, no external infra):
+  - capture reflects on-disk state (write keys → capture → `file_paths` + seqno match);
+  - **snapshot pins GC, stressed**: write, capture under a held snapshot, then force *real* flushes +
+    compaction (the spike's churn didn't flush — this test must), assert captured files survive until
+    the snapshot drops;
+  - **whole-database**: a db with two keyspaces captures both keyspace subtrees + `version`.
 
 ### M3 — Writer loop + retention, real round-trip
 - `Replicator::run`: capture every `interval`, `replicate_once`, `prune`.
@@ -45,20 +52,26 @@ tests pass against real infrastructure where the test matrix says so.
   it. Never delete a file a retained record references.
 - Force re-base (`snapshot_every`) so old files leave the bucket.
 - Tests (real fjall + Local/Mem store):
-  - **full round-trip**: write N keys → run writer → `restore_to(Latest)` into a fresh dir → open
-    fjall → assert every key present and equal;
-  - **point-in-time**: write batch A (seqno sA), write batch B (seqno sB) → restore at sA → assert A
-    present, B absent;
+  - **the decisive round-trip**: write N keys → run writer → `restore_to(Latest)` into a fresh dir →
+    **open it as a `Database` and read every key back, asserting equal.** This is the single most
+    important test; it also settles the open question of whether fjall opens a restored dir with no
+    journal and with the meta keyspace intact. If it doesn't, the fix surfaces here.
+  - **point-in-time by time** (the user-facing target): write batch A at time tA, batch B at tB →
+    restore at tA → assert A present, B absent. (Seqno targets are the internal mechanism; users
+    think in wall-clock, so the headline PITR test is time-based.)
   - **prune correctness**: after re-base + prune, restoring a still-retained version succeeds and a
     pruned version returns `OutsideRetention`;
   - prune never deletes a referenced file (assert by restoring every retained version).
 
-### M4 — Cold restore, complete
+### M4 — Cold restore, hardened
 - Verify each downloaded file's 128-bit XXH3 checksum (fjall SFA) before it lands; mismatch →
-  `ChecksumMismatch`.
-- Replay the journal segment up to the target seqno so the restored db opens at the exact point.
-- Tests: restore opens at exact seqno including un-flushed tail; a corrupted bucket file is caught by
-  checksum, not surfaced as silent data loss.
+  `ChecksumMismatch` (never silent data loss).
+- Atomic restore: stage into a temp dir, fsync, then rename into place — a crashed restore leaves no
+  half-built database.
+- (No journal replay in 0.1 — force-flush at capture means every version is complete on its own;
+  RPO = capture interval. Sub-flush RPO via journal streaming is deferred.)
+- Tests: a corrupted bucket file is caught by checksum; an interrupted restore leaves the target
+  either absent or complete, never partial.
 
 ### M5 — Hot follower (local-copy)
 - `Follower::poll_once`: find newest version (`resolve_version(Latest)`), download only missing
@@ -78,9 +91,11 @@ tests pass against real infrastructure where the test matrix says so.
     (record-written-last invariant holds; partial files are unreferenced and harmless);
   - kill the follower mid-download → assert it resumes from the last adopted version, never serves a
     partial one.
-- **Property test** (`proptest`): generate randomized op sequences (puts, deletes, flushes,
-  compactions) on a primary with continuous replication; at random points, restore to a fresh db and
-  assert it equals the primary's state at that seqno. This is the comprehensive correctness oracle.
+- **Model-based test** (start small, `proptest`): randomized op sequences (puts, deletes, forced
+  flushes) on a primary with continuous replication; at random points, restore to a fresh db and
+  assert it equals the primary's state at that point. Note: fjall compaction can't be driven
+  deterministically, so this is a bounded oracle, not exhaustive — the full property suite is
+  post-0.1. Don't let it pretend to cover compaction it didn't trigger.
 - **Real Tigris e2e** (gated): the M3 round-trip + M5 follower convergence, run against real Tigris
   using soup creds.
 
@@ -91,11 +106,52 @@ tests pass against real infrastructure where the test matrix says so.
 - Publish `0.1` to crates.io (dual-licensed).
 
 ### Deferred (post-0.1)
+- **Journal-tail streaming** for sub-flush RPO. Needs partial-journal replay-to-seqno, which fjall's
+  public API doesn't expose. 0.1 ships flush-granularity RPO instead.
 - **VFS / lazy-block follower**: read-only open against a remote block source + cache instead of a
   full local copy (Litestream v0.5's VFS read replica). Needs fjall to open against a pluggable block
   source — upstream work, or adopt SlateDB, which is object-storage-native.
 - **Version-change hook upstream in fjall/lsm-tree**, to replace the polling capture loop.
 - Multiple concurrent followers; cross-region fan-out.
+
+## Open decisions (resolve before the milestone that needs them)
+
+These came out of the design review; each changes scope, so decide deliberately:
+
+- **Promotion / failover (before M5).** Can a follower be promoted to writer (new generation, fenced
+  against the old one), or is recovery always restore-from-bucket? Decides whether "hot follower"
+  means failover or read-only standby.
+- **CLI (before M7).** Litestream's DR ergonomics come from a CLI (`litestream restore`). Ship a thin
+  `fjallstream restore` / `generations` / `status` binary, or library-only? Leaning yes — DR happens
+  under stress, not by writing Rust.
+- **Observability (build into M3).** A durability tool must answer "how far behind is my backup right
+  now?" Expose a `ReplicationStatus` (last successful version, lag seconds, pending bytes). Without it
+  a stalled backup is invisible until you need it.
+- **Split-brain fencing (before any promotion).** A fence/epoch per generation so a zombie old writer
+  can't interleave the version log. Out of scope only if promotion is.
+- **Encryption at rest** — Litestream supports age. Likely post-0.1; stated here so it's a choice, not
+  an omission.
+
+## User-journey e2e (the acceptance spine)
+
+The milestone tests above are mostly *mechanism* checks. These are the **user-perspective** tests —
+written as workflows a real operator runs, asserting the thing the user actually cares about. 0.1 is
+not done until A, B, C, and E pass on Local and on Tigris.
+
+- **A — Disaster recovery with measured RPO.** App writes continuously; `kill -9` the whole process
+  mid-write; restore from the bucket into a clean dir; assert recovered state equals committed state
+  minus at most one capture interval. (The number, not just "no dangling record.")
+- **B — Point-in-time to a wall-clock time.** Write over time; restore to "T"; assert the state as of
+  T. Exercises the real user-facing target (time), not just internal seqno.
+- **C — Read replica serving an app.** A follower answers real reads, converges within a lag bound,
+  and never returns a torn read across a version swap.
+- **D — Object store goes down.** Tigris returns errors / times out for ~60s while the app keeps
+  writing; assert the primary keeps serving (no block, no unbounded memory), replication backs off,
+  then catches up with zero data loss. (Depends on the M3 backpressure policy.)
+- **E — Restore on a clean machine.** Nothing local; the bucket is the only shared state. Proves the
+  bucket is genuinely self-contained.
+- **F — Failover/promotion.** Only if promotion is in scope (see Open decisions). Primary dies,
+  follower promotes to a new generation, old data intact, app continues writing.
 
 ## Test matrix
 

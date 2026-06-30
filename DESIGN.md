@@ -36,9 +36,10 @@ fjall already solved that internally:
 
 - **Files are immutable.** Compaction writes new files, never overwrites. So we ship whole files,
   content-addressed, once. No page deltas, no torn reads, no packaging format.
-- **The Version system is the consistency primitive.** A fjall `Version` is a point-in-time set
-  of immutable tables + blob files, retained copy-on-write until no snapshot references it. We
-  don't reconstruct a snapshot — a Version *is* one. We ship its file set.
+- **The Version system is the consistency primitive, and it's materialized on disk.** A fjall
+  `Version` is a point-in-time set of immutable tables, named by the `current` HEAD + `v<N>` manifest
+  files. Retained copy-on-write until no snapshot references it. We don't reconstruct a snapshot — a
+  Version *is* one, and it's already readable files we can ship.
 - **A held snapshot pins GC.** The checkpoint-truncation race — Litestream's nastiest problem —
   becomes "hold a snapshot while uploading." Native primitive, no fight.
 
@@ -47,33 +48,40 @@ Version, not the page or the WAL frame.**
 
 ## The model: replicate the Version DAG
 
-Mirror fjall's version history to a content-addressed object store. The bucket holds two things:
+Mirror fjall's version history to a content-addressed object store. The bucket holds:
 
-- a **write-once file store** — immutable SSTs + blob files, keyed by file id, dedup for free.
-- an ordered **version log** — each record is `{ seqno_watermark, file_ids[], parent }`, the exact
-  file set at that point — plus **journal segments** for the unflushed tail.
+- a **write-once file store** — the immutable files (SST tables, blob files, per-version manifest
+  files), keyed by their path inside the database, deduped for free.
+- an ordered **version log** — each record names the exact file set at that point, plus the bytes of
+  the few *mutable* pointer files (see "fjall on-disk layout") captured inline.
 
 Every operation is then the same thing from a different angle:
 
-- **Writer:** mirror local version history forward. On each new version: upload its not-yet-present
-  files, append the version record, ship the journal tail. Hold a snapshot across the upload so GC
-  can't race the delete.
-- **Restore (cold):** pick a version record, pull its `file_ids`, replay journal to the target seqno.
+- **Writer:** before capturing, force a flush so all committed data lives in immutable files, not the
+  journal. Hold a snapshot (pins GC), upload the not-yet-present files, write the version record with
+  the pointer-file bytes inline.
+- **Restore (cold):** pick a version record, pull its files, write the inline pointer files, open the
+  database.
 - **Follower (hot):** keep pulling the newest version record + new files, swap atomically (fjall's
   copy-on-write versions make in-flight reads safe). Same machinery, never stops.
 
 ### Why "base vs incremental" mostly dissolves
 
 Every version is already an incremental delta: copy-on-write versions share files, so successive
-version records overlap heavily in `file_ids`. We force a fresh full snapshot only to prune
-dependency chains and let old files GC out of the bucket — not because we need a consistency base.
-The journal is the only true tail replay, and only for the gap between the last flush and now.
+version records overlap heavily. We force a fresh full snapshot only to prune dependency chains and
+let old files GC out of the bucket — not because we need a consistency base.
 
-## Cursor / position
+## Cursor / position and RPO
 
-The replication position is `(version_seq, journal_offset)` — a log position. **Never** the
-per-key seqno read out of a file: fjall 3 rewrites per-key seqnos to 0 during bottom-level
-compaction, so file-embedded seqnos are not a stable cursor.
+The replication position is the **version sequence number** — a log position, **never** the per-key
+seqno read out of a file (fjall 3 rewrites per-key seqnos to 0 during bottom-level compaction, so
+file-embedded seqnos are not a stable cursor). The writer stamps wall-clock time on each version
+record for human-facing point-in-time targets; time is never used for ordering.
+
+In 0.1 we do **not** stream the journal. The writer forces a flush at capture, so every captured
+version is complete on its own and **RPO = the capture interval**. A user who needs tighter RPO
+shortens the interval or forces a flush. Journal-tail streaming (sub-flush RPO) is deferred — it
+needs a way to replay a partial journal up to a seqno that fjall's public API doesn't expose.
 
 ## Correctness invariants
 
@@ -81,45 +89,93 @@ compaction, so file-embedded seqnos are not a stable cursor.
   checksum-verified (fjall's SFA uses 128-bit XXH3) before adopting that version. Crash mid-download
   resumes from the last adopted version.
 - **Hold a snapshot across upload.** Guarantees the files of the version being uploaded are not
-  GC'd mid-flight.
+  GC'd mid-flight. Verified in fjall 3.1.5: files captured under a held `Snapshot` stay on disk
+  across subsequent flush + compaction.
+- **Force a flush before capture.** `Keyspace::rotate_memtable_and_wait()` on each keyspace pushes
+  committed data out of the journal into immutable SSTs, so the captured file set is complete without
+  shipping the 64 MiB journal.
+- **Mutable files ride inside the version record.** Only immutable files go in the content-addressed
+  store — dedup assumes a path maps to one byte sequence forever. The per-keyspace `current` HEAD
+  pointer is rewritten in place, so its bytes are captured inline in the version record, not deduped.
 - **Retention is best-effort with a bounded window.** Keep files referenced by the last N version
   records / T minutes. A follower that falls outside the window re-bootstraps from a full snapshot.
   A follower must never pin the writer's GC indefinitely.
 - **Generations.** A restore-and-diverge starts a new generation id so histories never cross.
 
-## Object layout
+## fjall on-disk layout (3.x, verified)
+
+Inspected against fjall 3.1.5 (`examples/spike_layout.rs`). A database is a **directory tree**, not a
+flat set of files:
+
+```
+<db>/
+  version                       # 4-byte format marker (immutable)
+  lock                          # exclusive process lock (never replicated)
+  0.jnl                         # journal: ONE preallocated ~64 MiB file (mutable; excluded in 0.1)
+  keyspaces/
+    <id>/                       # one dir per keyspace; id 1 is the always-present meta keyspace
+      current                   # ~25 B HEAD pointer to the active version manifest (MUTABLE)
+      v0, v1, v2, ...           # version-manifest files — fjall's Version DAG (immutable, append-only)
+      tables/<table-id>         # SST table files, named by id (immutable, id never reused)
+```
+
+This is the consistency boundary: a fjallstream "version" is the whole `keyspaces/` tree + the
+top-level `version` file at one point in time. **All keyspaces replicate together** (a restore is
+consistent across every keyspace in the database).
+
+### File taxonomy (what goes where)
+
+| File | Mutable? | How we replicate it |
+|---|---|---|
+| `keyspaces/<id>/tables/<table-id>` (SSTs, blobs) | no | content-addressed file store, dedup |
+| `keyspaces/<id>/v<N>` (version manifests) | no | content-addressed file store, dedup |
+| `version` (format marker) | no | content-addressed file store |
+| `keyspaces/<id>/current` (HEAD pointer) | **yes** | bytes captured inline in the version record |
+| `0.jnl` (journal) | yes | excluded in 0.1 (force-flush makes it unneeded) |
+| `lock` | — | never replicated |
+
+## Object (bucket) layout
 
 ```
 bucket/<db>/generations/<gen>/
-    files/<file-id>            # immutable SSTs + blobs, uploaded once, dedup across versions
-    versions/<seqno>.json      # { seqno, parent, file_ids[], journal_ref, ts }
+    format                     # one object: the fjallstream bucket-format version
+    files/<relpath>            # immutable files keyed by their path in the db, uploaded once
+    versions/<seqno>.json      # { seqno, parent, file_paths[], pointers[], is_snapshot, ts_millis }
     snapshots/<seqno>.json     # a version record flagged as a full re-base point
-    journal/<from>-<to>.seg    # journal tail per version
 ```
 
-## Pragmatic v1 vs upstream-later
+`pointers[]` carries `(relpath, bytes)` for the mutable HEAD files. There is no `journal/` in 0.1.
+
+## Capture strategy (M2), verified feasible
 
 Buildable today against fjall's public API (no upstream changes):
 
-- Writer loop: hold `Snapshot`, list the database directory (immutable files are safe to read),
-  upload new files, write a version record, ship the journal.
-- Cold restore.
-- Local-copy hot follower: download a new version's files, open a read-only `Database` at the new
-  file set, atomically swap the handle readers use.
+1. **Force flush** — `rotate_memtable_and_wait()` on each keyspace so committed data is in SSTs.
+2. **Pin** — `db.snapshot()`; record `db.visible_seqno()` as the version seqno.
+3. **Walk** — collect every file under the db dir; immutable ones become `file_paths` (relpath ids),
+   `current` files become `pointers`, skip `*.jnl` and `lock`.
+4. **Drop snapshot**, then `replicate_once`: upload not-yet-present files, write the version record.
 
-Needs fjall upstream work (deferred):
+**Restore** lays the `files/` tree back down, writes the inline pointer files and `version`, and
+opens a `Database`. **Cold restore must be proven by opening the restored db and reading keys back**
+— that is the decisive test (PLAN M3), and it also settles the open question of whether fjall opens a
+restored dir with no journal.
 
-- Enumerate a version's exact file set via API (v1 lists the directory instead).
-- A version-change hook to replace polling.
+### Deferred (needs upstream fjall work or a bigger lift)
+
+- Journal-tail streaming for sub-flush RPO (needs partial-journal replay-to-seqno; not in public API).
+- A version-change hook to replace the polling capture loop.
 - VFS / lazy-block follower: open read-only against a remote block source + cache instead of a full
-  local copy (the Litestream v0.5 VFS-read-replica idea). Or adopt SlateDB, which is built for this.
+  local copy (Litestream v0.5's VFS read replica). Or adopt SlateDB, which is built for this.
 
 ## Module map
 
 - `object_store` — the `ObjectStore` trait + a `LocalObjectStore` for tests/dev. Only thing that
   changes per backend.
-- `types` — `Generation`, `VersionRecord`, `FileId`, `Cursor`.
+- `types` — `Generation`, `VersionRecord` (carries `file_paths` + inline `pointers`), `FileId` (a
+  relative path inside the db), `Cursor`.
 - `layout` — bucket key construction.
+- `capture` — the fjall seam: flush + snapshot + walk → `LocalVersion`. Verified against fjall 3.1.5.
 - `replicator` — the writer loop.
 - `restore` — cold reader.
 - `follower` — hot reader.
