@@ -21,6 +21,9 @@ use std::path::Path;
 /// upload finishes, then drop it.
 pub struct Captured {
     pub version: LocalVersion,
+    /// How many times capture retried before getting a consistent set (0 = first try). Exposed so
+    /// tests can confirm the C6 consistency guard actually fired under churn.
+    pub retries: u32,
     // Held to keep GC from deleting captured files mid-upload. Dropped with `Captured`.
     _snapshot: fjall::Snapshot,
 }
@@ -52,7 +55,7 @@ pub fn capture(
             .map_err(|e| Error::Fjall(format!("flush keyspace {:?}: {e}", ks.name())))?;
     }
 
-    for _ in 0..CAPTURE_RETRIES {
+    for attempt in 0..CAPTURE_RETRIES {
         // Pin GC. Held inside `Captured` until the caller drops it.
         let snapshot = db.snapshot();
         let seqno: u64 = snapshot.seqno();
@@ -61,17 +64,31 @@ pub fn capture(
         // and the pointer check wouldn't catch it (its `current` isn't in our list yet).
         let keyspaces_before = db.keyspace_count();
 
-        // Walk the directory into immutable files, directories, and inline pointer files.
+        // Walk the directory into immutable files, directories, journals, and inline pointer files.
+        // A file or directory vanishing mid-walk (racing compaction or keyspace change) surfaces as
+        // NotFound; treat that as "inconsistent, retry" rather than a hard error.
         let mut files = Vec::new();
         let mut dirs = Vec::new();
+        let mut journals = Vec::new();
         let mut pointers = Vec::new();
-        walk(db_path, db_path, &mut files, &mut dirs, &mut pointers)?;
+        match walk(db_path, db_path, &mut files, &mut dirs, &mut journals, &mut pointers) {
+            Ok(()) => {}
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                drop(snapshot);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
 
-        // Consistent iff the manifest was stable (no `current` moved) AND the keyspace set didn't
-        // change across the walk.
+        // Consistent iff the manifest was stable (no `current` moved), the keyspace set didn't change
+        // across the walk, AND the journals can be read without racing background maintenance
+        // (rotation/truncation), which would ship a torn journal that won't recover.
         if db.keyspace_count() == keyspaces_before && pointers_unchanged(db_path, &pointers)? {
-            let version = LocalVersion { seqno, parent, files, dirs, pointers };
-            return Ok(Captured { version, _snapshot: snapshot });
+            if let Some(journal_bytes) = read_journals_stable(db_path, &journals)? {
+                let version =
+                    LocalVersion { seqno, parent, files, dirs, journals: journal_bytes, pointers };
+                return Ok(Captured { version, retries: attempt as u32, _snapshot: snapshot });
+            }
         }
         // Something moved under us — drop the snapshot and try again.
         drop(snapshot);
@@ -80,6 +97,54 @@ pub fn capture(
     Err(Error::Fjall(format!(
         "could not capture a stable manifest after {CAPTURE_RETRIES} tries (compaction churn)"
     )))
+}
+
+/// Read the journal files consistently, returning `None` (retry) if any raced background
+/// maintenance. Journals aren't pinned by the snapshot and are truncated/rotated when a flush's
+/// entries are reclaimed, so we read each one bracketed by length checks and confirm the set of
+/// `*.jnl` files in the db root is exactly what we captured. A torn journal makes recovery fail with
+/// EINVAL, so this must be airtight.
+fn read_journals_stable(db_path: &Path, journals: &[NamedPath]) -> Result<Option<Vec<NamedBytes>>> {
+    // The set of journal files must match what the walk saw (no rotation added/removed one).
+    let mut on_disk = std::collections::BTreeSet::new();
+    let rd = std::fs::read_dir(db_path).map_err(|source| Error::Io { path: db_path.to_path_buf(), source })?;
+    for entry in rd {
+        let entry = entry.map_err(|source| Error::Io { path: db_path.to_path_buf(), source })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".jnl") {
+            on_disk.insert(name);
+        }
+    }
+    let captured: std::collections::BTreeSet<String> = journals.iter().map(|(n, _)| n.clone()).collect();
+    if on_disk != captured {
+        return Ok(None);
+    }
+
+    let mut out = Vec::with_capacity(journals.len());
+    for (name, path) in journals {
+        let len_before = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::Io { path: path.clone(), source }),
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::Io { path: path.clone(), source }),
+        };
+        let len_after = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::Io { path: path.clone(), source }),
+        };
+        // If the file's length moved across the read (truncation/rotation in flight), the bytes may
+        // be torn — retry.
+        if len_before != len_after || bytes.len() as u64 != len_after {
+            return Ok(None);
+        }
+        out.push((name.clone(), bytes));
+    }
+    Ok(Some(out))
 }
 
 /// True if every captured `current` pointer still holds the bytes we recorded. A changed or missing
@@ -96,11 +161,15 @@ fn pointers_unchanged(db_path: &Path, pointers: &[PointerFile]) -> Result<bool> 
     Ok(true)
 }
 
+type NamedPath = (String, std::path::PathBuf);
+type NamedBytes = (String, Vec<u8>);
+
 fn walk(
     base: &Path,
     dir: &Path,
     files: &mut Vec<(FileId, std::path::PathBuf)>,
     dirs: &mut Vec<String>,
+    journals: &mut Vec<NamedPath>,
     pointers: &mut Vec<PointerFile>,
 ) -> Result<()> {
     let rd = std::fs::read_dir(dir).map_err(|source| Error::Io { path: dir.to_path_buf(), source })?;
@@ -120,14 +189,20 @@ fn walk(
 
         if ft.is_dir() {
             dirs.push(rel);
-            walk(base, &path, files, dirs, pointers)?;
+            walk(base, &path, files, dirs, journals, pointers)?;
             continue;
         }
 
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Never replicate the lock, and skip the journal entirely (force-flush makes it unneeded).
-        if name == "lock" || rel.ends_with(".jnl") {
+        // Never replicate the lock (a 0-byte runtime artifact restore recreates).
+        if name == "lock" {
+            continue;
+        }
+
+        // Journals are mutable; ship them per-version (they carry the seqno watermark).
+        if rel.ends_with(".jnl") {
+            journals.push((rel, path));
             continue;
         }
 

@@ -9,6 +9,7 @@
 //! SQLite's mutable pages.
 
 pub mod capture;
+mod compress;
 pub mod error;
 pub mod follower;
 pub mod layout;

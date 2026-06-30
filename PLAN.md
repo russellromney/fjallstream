@@ -34,16 +34,26 @@ tests pass against real infrastructure where the test matrix says so.
 Built and green: `capture()` (flush → snapshot → walk → consistency-verified), `FileId` is now a
 relative path, `VersionRecord` carries inline `pointers`, restore recreates the `lock` file, and the
 decisive M3 round-trip (write → capture → replicate → restore → **open → read every key back**) passes
-against real fjall 3.1.5 — no journal shipped, meta keyspace intact. Two findings folded in: capture
-retries if compaction moves `current` mid-walk; restore must recreate the `lock` file (fjall opens it
-without creating).
+against real fjall 3.1.5, meta keyspace intact. Findings folded in: capture retries if compaction
+moves `current` mid-walk; restore must recreate the `lock` file; and **the journal must be shipped**
+(per-version, gzip-compressed) — it carries the seqno watermark, without which a restored db is at
+`visible_seqno = 0` and iterators/snapshots see nothing.
 
-**Correctness hardening done** (the review's "fix now" set): C1 dead-file tolerance (drop files GC'd
-mid-upload), C6 keyspace-set stability + empty-directory replication, C7 monotonic timestamps, C2
-atomic non-clobbering restore (stage → fsync → rename). C3/C4/P3 are stated as guarantees in
-DESIGN.md "Consistency guarantees"; their full fixes live in ROADMAP.md. Proven by `tests/stress.rs`
-(20 capture→restore→open cycles under a concurrent write flood + compaction) and
-`tests/multi_keyspace.rs` (two keyspaces incl. an empty one).
+**Correctness hardening done** (the review's "fix now" set): C1 dead-file tolerance, C6 keyspace-set
+stability + empty-directory replication, C7 monotonic timestamps, C2 atomic non-clobbering restore.
+C3/C4/P3 are stated as guarantees in DESIGN.md "Consistency guarantees".
+
+**Proof layer done** — guards aren't trusted, they're demonstrated:
+- `tests/guards.rs` — C1 vanished-file drop fires + is counted; C6 retry fires under keyspace churn;
+  restore-into-non-empty errors; a missing referenced file fails loudly; corruption is detected
+  (fjall's XXH3), never silently served.
+- `tests/crash.rs` — fault-injected crash mid-upload leaves no version record; crash mid-restore
+  leaves the target absent (atomic stage→rename).
+- `tests/pitr.rs` — point-in-time restore by **seqno and wall-clock** on real fjall.
+- `tests/property.rs` — model oracle: random insert/delete sequences, restore == model exactly
+  (via `len()`/iteration, which is what caught the journal/seqno bug).
+- `tests/stress.rs` — 20 capture→restore→open cycles under a write flood + compaction;
+  `tests/multi_keyspace.rs` — two keyspaces incl. an empty one.
 
 Original plan (for reference):
 - `capture(db, db_path, keyspaces) -> LocalVersion` (see DESIGN.md "Capture strategy"):
@@ -69,8 +79,8 @@ Original plan (for reference):
 - Tests (real fjall + Local/Mem store):
   - **the decisive round-trip**: write N keys → run writer → `restore_to(Latest)` into a fresh dir →
     **open it as a `Database` and read every key back, asserting equal.** This is the single most
-    important test; it also settles the open question of whether fjall opens a restored dir with no
-    journal and with the meta keyspace intact. If it doesn't, the fix surfaces here.
+    important test. (It settled the journal question: a restored dir needs its journal — shipped
+    per-version — or `visible_seqno` is 0 and iteration breaks. The property oracle caught it.)
   - **point-in-time by time** (the user-facing target): write batch A at time tA, batch B at tB →
     restore at tA → assert A present, B absent. (Seqno targets are the internal mechanism; users
     think in wall-clock, so the headline PITR test is time-based.)
@@ -83,8 +93,8 @@ Original plan (for reference):
   `ChecksumMismatch` (never silent data loss).
 - Atomic restore: stage into a temp dir, fsync, then rename into place — a crashed restore leaves no
   half-built database.
-- (No journal replay in 0.1 — force-flush at capture means every version is complete on its own;
-  RPO = capture interval. Sub-flush RPO via journal streaming is deferred.)
+- The per-version journal (shipped gzip-compressed) lets recovery replay it and restore the seqno
+  watermark; RPO = capture interval. *Continuous* journal streaming for sub-flush RPO is deferred.
 - Tests: a corrupted bucket file is caught by checksum; an interrupted restore leaves the target
   either absent or complete, never partial.
 

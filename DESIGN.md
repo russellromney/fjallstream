@@ -78,10 +78,15 @@ seqno read out of a file (fjall 3 rewrites per-key seqnos to 0 during bottom-lev
 file-embedded seqnos are not a stable cursor). The writer stamps wall-clock time on each version
 record for human-facing point-in-time targets; time is never used for ordering.
 
-In 0.1 we do **not** stream the journal. The writer forces a flush at capture, so every captured
-version is complete on its own and **RPO = the capture interval**. A user who needs tighter RPO
-shortens the interval or forces a flush. Journal-tail streaming (sub-flush RPO) is deferred — it
-needs a way to replay a partial journal up to a seqno that fjall's public API doesn't expose.
+We ship the journal per-version (gzip-compressed), but we do **not** continuously *stream* it. The
+writer forces a flush at capture so committed data is in SSTs, then ships the journal — it carries
+the **sequence-number watermark** that recovery needs. (We learned the hard way that skipping it
+leaves the restored db at `visible_seqno = 0`: point `get()`s work but iterators, range scans, and
+snapshots see nothing, and new writes collide on low seqnos. See "Two things the implementation
+learned".) Every captured version is complete on its own, so **RPO = the capture interval**. A user
+who needs tighter RPO shortens the interval. Continuous journal-tail streaming (sub-flush RPO) is
+deferred — it needs a way to replay a partial journal up to a seqno that fjall's public API doesn't
+expose.
 
 ## Correctness invariants
 
@@ -92,8 +97,9 @@ needs a way to replay a partial journal up to a seqno that fjall's public API do
   GC'd mid-flight. Verified in fjall 3.1.5: files captured under a held `Snapshot` stay on disk
   across subsequent flush + compaction.
 - **Force a flush before capture.** `Keyspace::rotate_memtable_and_wait()` on each keyspace pushes
-  committed data out of the journal into immutable SSTs, so the captured file set is complete without
-  shipping the 64 MiB journal.
+  committed data out of the journal into immutable SSTs, minimizing the journal's live content. We
+  still ship the journal (gzip-compressed, ~64 MiB of mostly zeros → a few hundred KB) because it
+  carries the seqno watermark recovery needs.
 - **Mutable files ride inside the version record.** Only immutable files go in the content-addressed
   store — dedup assumes a path maps to one byte sequence forever. The per-keyspace `current` HEAD
   pointer is rewritten in place, so its bytes are captured inline in the version record, not deduped.
@@ -127,7 +133,7 @@ flat set of files:
 <db>/
   version                       # 4-byte format marker (immutable)
   lock                          # exclusive process lock (never replicated)
-  0.jnl                         # journal: ONE preallocated ~64 MiB file (mutable; excluded in 0.1)
+  0.jnl                         # journal: ONE preallocated ~64 MiB file (mutable; shipped per-version, gzipped)
   keyspaces/
     <id>/                       # one dir per keyspace; id 1 is the always-present meta keyspace
       current                   # ~25 B HEAD pointer to the active version manifest (MUTABLE)
@@ -147,7 +153,7 @@ consistent across every keyspace in the database).
 | `keyspaces/<id>/v<N>` (version manifests) | no | content-addressed file store, dedup |
 | `version` (format marker) | no | content-addressed file store |
 | `keyspaces/<id>/current` (HEAD pointer) | **yes** | bytes captured inline in the version record |
-| `0.jnl` (journal) | yes | excluded in 0.1 (force-flush makes it unneeded) |
+| `0.jnl` (journal) | yes | shipped per-version, gzip-compressed (carries the seqno watermark) |
 | `lock` | — | never replicated |
 
 ## Object (bucket) layout
@@ -156,11 +162,13 @@ consistent across every keyspace in the database).
 bucket/<db>/generations/<gen>/
     format                     # one object: the fjallstream bucket-format version
     files/<relpath>            # immutable files keyed by their path in the db, uploaded once
-    versions/<seqno>.json      # { seqno, parent, file_paths[], pointers[], is_snapshot, ts_millis }
+    journals/<seqno>/<name>    # per-version journal files (gzip), e.g. journals/<seqno>/0.jnl
+    versions/<seqno>.json      # { seqno, parent, file_ids[], dirs[], pointers[], journals[], ts_millis }
     snapshots/<seqno>.json     # a version record flagged as a full re-base point
 ```
 
-`pointers[]` carries `(relpath, bytes)` for the mutable HEAD files. There is no `journal/` in 0.1.
+`pointers[]` carries `(relpath, bytes)` for the mutable HEAD files. `journals[]` lists the per-version
+journal names; journals are keyed per-version (not content-addressed) because they're mutable.
 
 ## Capture strategy (M2), verified feasible
 
@@ -168,11 +176,11 @@ Buildable today against fjall's public API (no upstream changes):
 
 1. **Force flush** — `rotate_memtable_and_wait()` on each keyspace so committed data is in SSTs.
 2. **Pin** — `db.snapshot()`; record `db.visible_seqno()` as the version seqno.
-3. **Walk** — collect every file under the db dir; immutable ones become `file_paths` (relpath ids),
-   `current` files become `pointers`, skip `*.jnl` and `lock`.
-4. **Drop snapshot**, then `replicate_once`: upload not-yet-present files, write the version record.
+3. **Walk** — collect every file under the db dir; immutable ones become `file_ids` (relpath),
+   `current` files become inline `pointers`, `*.jnl` become per-version `journals`, skip `lock`.
+4. **Drop snapshot**, then `replicate_once`: upload not-yet-present files + journals, write the record.
 
-Two things the implementation learned by running it (fjall 3.1.5), both now handled:
+Four things the implementation learned by running it (fjall 3.1.5), all now handled:
 
 - **Capture must be consistent against background compaction.** A held snapshot pins SST *data*, but
   compaction keeps rewriting the on-disk `v<N>` manifests and the `current` HEAD while we walk. We
@@ -182,11 +190,23 @@ Two things the implementation learned by running it (fjall 3.1.5), both now hand
 - **The `lock` file must exist to recover.** fjall's recovery opens `lock` without creating it, so a
   restored dir needs one. We don't replicate it (it's a 0-byte runtime artifact); restore recreates
   an empty one.
+- **The journal carries the seqno watermark — you can't skip it.** We originally dropped the journal
+  (force-flush put all data in SSTs). A property-test oracle caught the bug: recovery only restores
+  the sequence counter during journal replay, so a journal-less restore comes up at `visible_seqno =
+  0`. Point `get()`s (which read at `SeqNo::MAX`) work, but iterators/range/snapshots (which read at
+  `visible_seqno`) see nothing, and new writes collide on low seqnos. Fix: ship the journal per-version,
+  gzip-compressed.
+- **The journal must be captured consistently, or restore fails with EINVAL.** The same oracle, run
+  repeatedly, flaked ~37%: background journal maintenance truncates/rotates a journal between when the
+  walk records its path and when we read its bytes, shipping a torn journal that recovery rejects. The
+  snapshot pins SSTs, not journals. Fix: read journal bytes *inside* the consistency window, bracketed
+  by length checks, and confirm the `*.jnl` set is unchanged; retry if anything moved. Ship those exact
+  bytes (no late read).
 
-**Restore** lays the `files/` tree back down, writes the inline pointer files, recreates an empty
-`lock`, and opens a `Database`. **Proven** (PLAN M3): a real db is captured, replicated, restored into
-a clean dir, opened, and every key reads back equal — including with no journal shipped and the meta
-keyspace (id 0) intact.
+**Restore** lays the `files/` tree back down, writes the inline pointer files, the per-version
+journals, recreates an empty `lock`, and opens a `Database`. **Proven**: a real db is captured,
+replicated, restored into a clean dir, opened, and every key reads back equal — via both point gets
+*and* iteration (`len()`), with the meta keyspace (id 0) intact.
 
 ### Deferred (needs upstream fjall work or a bigger lift)
 

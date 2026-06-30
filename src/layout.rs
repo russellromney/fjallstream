@@ -46,8 +46,10 @@ impl Layout {
         format!("{}/snapshots/{:020}.json", self.base(), seqno)
     }
 
-    pub fn journal_segment(&self, from: u64, to: u64) -> String {
-        format!("{}/journal/{:020}-{:020}.seg", self.base(), from, to)
+    /// A journal file for one version. Journals are mutable (rewritten in place), so they are keyed
+    /// per-version rather than content-addressed — each capture ships its own copy.
+    pub fn journal(&self, seqno: u64, name: &str) -> String {
+        format!("{}/journals/{:020}/{}", self.base(), seqno, name)
     }
 
     /// Parse a `versions/<seqno>.json` key back to its seqno. Returns `None` if the key isn't a

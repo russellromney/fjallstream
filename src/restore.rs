@@ -96,6 +96,14 @@ pub async fn restore_to<S: ObjectStore>(
         write_file(&staging, &id.0, &bytes).await?;
     }
 
+    // Journals, keyed per-version (gzip-compressed). Required for recovery to restore the seqno
+    // watermark — without them the restored db has visible_seqno 0 and iterators see nothing.
+    for name in &record.journals {
+        let compressed = store.get(&layout.journal(record.seqno, name)).await?;
+        let bytes = crate::compress::gunzip(&compressed)?;
+        write_file(&staging, name, &bytes).await?;
+    }
+
     // Mutable pointer files (each keyspace's `current` HEAD), captured inline in the record.
     for p in &record.pointers {
         write_file(&staging, &p.path, &p.bytes).await?;

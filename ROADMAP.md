@@ -50,6 +50,9 @@ Not S3-specific, but bigger than the 0.1 core or blocked on a fjall API we don't
 - `prune` + retention-window GC of superseded files.
 - A `fjallstream` CLI for disaster recovery (`restore`, `generations`, `status`).
 - Journal-tail streaming for sub-flush RPO (needs partial-journal replay-to-seqno).
+- Journal shipping optimization: per-version journals are gzip-compressed (~64 MiB of zeros → a few
+  hundred KB), but still shipped every version. Could content-hash to dedup unchanged journals, or
+  trim to the used length before compressing.
 - Version-change hook upstream in fjall/lsm-tree to replace the polling capture loop.
 - Observability: replication lag / RPO status surface.
 - Encryption at rest.

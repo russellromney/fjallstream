@@ -34,6 +34,9 @@ pub struct LocalVersion {
     pub files: Vec<(FileId, PathBuf)>,
     /// Relative paths of every directory in the db tree (so restore can recreate empty ones).
     pub dirs: Vec<String>,
+    /// Journal files as `(name, bytes)` — read consistently at capture time (journals race
+    /// background maintenance, so capture reads + verifies them rather than leaving a late read).
+    pub journals: Vec<(String, Vec<u8>)>,
     /// The mutable pointer files (each keyspace's `current` HEAD), captured by value.
     pub pointers: Vec<PointerFile>,
 }
@@ -68,11 +71,19 @@ pub struct Replicator<S: ObjectStore> {
     /// Last `ts_millis` we wrote, so version timestamps stay monotonic even if the wall clock steps
     /// backwards (NTP). Time-based restore targets rely on this.
     last_ts_millis: u64,
+    /// Cumulative count of files dropped by the C1 vanished-file guard. Exposed so tests (and
+    /// operators) can confirm the guard actually fired rather than trusting it silently.
+    files_dropped: u64,
 }
 
 impl<S: ObjectStore> Replicator<S> {
     pub fn new(store: S, layout: Layout, cfg: ReplicateConfig) -> Self {
-        Self { store, layout, cfg, versions_since_snapshot: 0, last_ts_millis: 0 }
+        Self { store, layout, cfg, versions_since_snapshot: 0, last_ts_millis: 0, files_dropped: 0 }
+    }
+
+    /// Total files dropped by the C1 vanished-file guard across all `replicate_once` calls.
+    pub fn files_dropped(&self) -> u64 {
+        self.files_dropped
     }
 
     /// Replicate one captured version: upload its not-yet-present files, ship its journal tail, and
@@ -94,20 +105,35 @@ impl<S: ObjectStore> Replicator<S> {
             }
             let bytes = match tokio::fs::read(path).await {
                 Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.files_dropped += 1;
+                    continue;
+                }
                 Err(source) => return Err(crate::error::Error::Io { path: path.clone(), source }),
             };
             self.store.put(&key, Bytes::from(bytes)).await?;
             present_ids.push(id.clone());
         }
 
-        // 2. Decide whether this is a forced re-base point.
+        // 2. Upload this version's journal files, keyed per-version (mutable, never deduped). The
+        //    bytes were read consistently at capture; here we just compress and ship them. Journals
+        //    are ~64 MiB of mostly zeros after a force-flush, so gzip shrinks them to KB.
+        let mut journal_names = Vec::with_capacity(version.journals.len());
+        for (name, bytes) in &version.journals {
+            let compressed = crate::compress::gzip(bytes)?;
+            self.store
+                .put(&self.layout.journal(version.seqno, name), Bytes::from(compressed))
+                .await?;
+            journal_names.push(name.clone());
+        }
+
+        // 3. Decide whether this is a forced re-base point.
         let is_snapshot =
             matches!(self.cfg.snapshot_every, Some(n) if self.versions_since_snapshot + 1 >= n);
 
-        // 3. Write the version record last (the commit point). The mutable pointer files ride
-        //    inline; there is no journal in 0.1 (capture force-flushes first). The timestamp is kept
-        //    monotonic across versions so a backward clock step can't reorder time-based restore. (C7)
+        // 4. Write the version record last (the commit point). The mutable pointer files ride
+        //    inline; journals are referenced per-version. The timestamp is kept monotonic across
+        //    versions so a backward clock step can't reorder time-based restore. (C7)
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -120,6 +146,7 @@ impl<S: ObjectStore> Replicator<S> {
             file_ids: present_ids,
             dirs: version.dirs.clone(),
             pointers: version.pointers.clone(),
+            journals: journal_names,
             is_snapshot,
             ts_millis,
         };

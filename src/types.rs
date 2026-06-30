@@ -43,6 +43,11 @@ pub struct VersionRecord {
     pub dirs: Vec<String>,
     /// The mutable pointer files (e.g. each keyspace's `current` HEAD), captured inline.
     pub pointers: Vec<PointerFile>,
+    /// Journal file names shipped for this version (e.g. `0.jnl`). Stored per-version, not
+    /// content-addressed. Required for recovery to restore the sequence-number watermark — without
+    /// it the restored db has visible_seqno 0 and iterators/snapshots see nothing.
+    #[serde(default)]
+    pub journals: Vec<String>,
     /// True if this record is a full re-base point (a fresh snapshot) rather than an incremental
     /// version. Re-base points let old files GC out of the bucket by breaking dependency chains.
     pub is_snapshot: bool,
