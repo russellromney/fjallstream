@@ -37,6 +37,9 @@ pub struct VersionRecord {
     pub parent: Option<u64>,
     /// Every immutable file the database references at this version (keyed by relative path).
     pub file_ids: Vec<FileId>,
+    /// FNV-1a content hashes, aligned 1:1 with `file_ids`, verified on restore.
+    #[serde(default)]
+    pub file_checksums: Vec<u64>,
     /// Relative paths of every directory in the database tree, so restore can recreate empty ones
     /// (e.g. a freshly created keyspace's `tables/`, which fjall's recovery does not create).
     #[serde(default)]
@@ -48,9 +51,9 @@ pub struct VersionRecord {
     /// it the restored db has visible_seqno 0 and iterators/snapshots see nothing.
     #[serde(default)]
     pub journals: Vec<String>,
-    /// True if this record is a full re-base point (a fresh snapshot) rather than an incremental
-    /// version. Re-base points let old files GC out of the bucket by breaking dependency chains.
-    pub is_snapshot: bool,
+    /// FNV-1a content hashes, aligned 1:1 with `journals`, verified on restore.
+    #[serde(default)]
+    pub journal_checksums: Vec<u64>,
     /// Wall-clock time the version was recorded, milliseconds since the Unix epoch. Used only for
     /// human-facing point-in-time restore targets, never for ordering.
     pub ts_millis: u64,
@@ -62,14 +65,6 @@ pub struct VersionRecord {
 pub struct PointerFile {
     pub path: String,
     pub bytes: Vec<u8>,
-}
-
-/// A reader's position in the replication stream. This is a log position, never a per-key seqno
-/// (fjall rewrites per-key seqnos to 0 during bottom-level compaction).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cursor {
-    pub version_seqno: u64,
-    pub journal_offset: u64,
 }
 
 /// What point in time to restore to.

@@ -115,9 +115,11 @@ What a restore actually promises, and the limits we accept for now:
 - **Per-keyspace crash-consistency, not a cross-keyspace transactional cut.** Capture flushes each
   keyspace then takes one snapshot; a transaction spanning keyspaces can land on different sides of
   the cut. Single-keyspace restores are crash-consistent. A true cross-keyspace cut is roadmap (C4).
-- **The version seqno is an upper bound.** Writes in the flush→snapshot window aren't in the shipped
-  SSTs, so "restore to seqno S" lands *at or before* S. Recording the exact durable seqno needs a
-  fjall API we don't have yet (roadmap, C3).
+- **The version seqno is an honest upper bound.** It's `db.seqno()` (the next sequence number) read
+  *after* the journal is captured, so it exceeds every write the version contains. "Restore at or
+  before S" therefore never returns content past S — it's conservative (it may decline a version
+  whose content is ≤ S but whose recorded bound is > S), never wrong. Verified under concurrent
+  writes by `tests/consistency.rs` (the restored cut is always a contiguous prefix).
 - **Restore is atomic and won't clobber.** It stages into a sibling dir, fsyncs, and renames into
   place; it refuses a non-empty target. A crash leaves the target absent or complete, never torn.
 - **RPO = capture interval; don't capture sub-second.** Each capture force-flushes a memtable
@@ -160,15 +162,17 @@ consistent across every keyspace in the database).
 
 ```
 bucket/<db>/generations/<gen>/
-    format                     # one object: the fjallstream bucket-format version
     files/<relpath>            # immutable files keyed by their path in the db, uploaded once
     journals/<seqno>/<name>    # per-version journal files (gzip), e.g. journals/<seqno>/0.jnl
-    versions/<seqno>.json      # { seqno, parent, file_ids[], dirs[], pointers[], journals[], ts_millis }
-    snapshots/<seqno>.json     # a version record flagged as a full re-base point
+    versions/<seqno>.json      # the version record (below)
 ```
 
-`pointers[]` carries `(relpath, bytes)` for the mutable HEAD files. `journals[]` lists the per-version
-journal names; journals are keyed per-version (not content-addressed) because they're mutable.
+A version record is `{ seqno, parent, file_ids[], file_checksums[], dirs[], pointers[], journals[],
+journal_checksums[], ts_millis }`. `pointers[]` carries `(relpath, bytes)` for the mutable HEAD files;
+`journals[]` lists the per-version journal names (keyed per-version, not content-addressed, because
+they're mutable). `file_checksums[]`/`journal_checksums[]` are FNV-1a hashes verified on restore.
+Every version record is self-contained (a full file set), so there is no separate "snapshot" / re-base
+concept — `prune` just keeps the newest N records and deletes files no retained record references.
 
 ## Capture strategy (M2), verified feasible
 

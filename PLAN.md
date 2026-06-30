@@ -22,7 +22,12 @@ tests pass against real infrastructure where the test matrix says so.
   `Snapshot` pins GC, and found `rotate_memtable_and_wait()` for force-flush. See DESIGN.md "fjall
   on-disk layout". This resolves what was the project's biggest unknown (consistent capture).
 
-### M1 — Object store: conformance + real backends
+### M1 — Object store: conformance + real backends — PARTIAL (S3 left)
+DONE: `MemObjectStore` + a shared conformance suite (`tests/conformance.rs`) that pins the recursive
+`list` contract and runs against Local and Mem. `list` is now recursive on both. STILL TODO: the
+`S3ObjectStore` backend (feature `s3`) + running conformance against real Tigris via the
+`FJALLSTREAM_E2E=tigris` gate.
+
 - `MemObjectStore` (in-memory, for fast tests).
 - `S3ObjectStore` (feature `s3`) speaking S3/Tigris via the AWS SDK; reads `AWS_*` env.
 - A **shared conformance suite** every backend runs (Local, Mem, S3): put/get/list/delete/exists,
@@ -71,7 +76,13 @@ Original plan (for reference):
     the snapshot drops;
   - **whole-database**: a db with two keyspaces captures both keyspace subtrees + `version`.
 
-### M3 — Writer loop + retention, real round-trip
+### M3 — Writer loop + retention, real round-trip — DONE
+`Replicator::run()` (capture → replicate → prune → sleep) and `prune()` (retention window: keep newest
+`retention_versions`, delete older records + files no retained version references) are implemented.
+Proven by `tests/prune.rs`. The re-base/`is_snapshot`/`snapshots/` machinery was removed — every
+version record is already self-contained, so it was dead weight.
+
+Original plan (for reference):
 - `Replicator::run`: capture every `interval`, `replicate_once`, `prune`.
 - `prune`: compute the live file set across the retained version window, delete only files outside
   it. Never delete a file a retained record references.
@@ -88,7 +99,13 @@ Original plan (for reference):
     pruned version returns `OutsideRetention`;
   - prune never deletes a referenced file (assert by restoring every retained version).
 
-### M4 — Cold restore, hardened
+### M4 — Cold restore, hardened — DONE
+Checksum verify is implemented: each uploaded file/journal gets an FNV-1a content hash in the version
+record, verified on restore before it lands — bucket corruption fails loudly with `ChecksumMismatch`
+*before* fjall opens the db (`tests/guards.rs::corrupted_file_is_detected...`). Restore is atomic
+(stage → fsync files + dirs → rename), refuses a non-empty target, and cleans staging on any error.
+
+Original plan (for reference):
 - Verify each downloaded file's 128-bit XXH3 checksum (fjall SFA) before it lands; mismatch →
   `ChecksumMismatch` (never silent data loss).
 - Atomic restore: stage into a temp dir, fsync, then rename into place — a crashed restore leaves no
@@ -98,7 +115,14 @@ Original plan (for reference):
 - Tests: a corrupted bucket file is caught by checksum; an interrupted restore leaves the target
   either absent or complete, never partial.
 
-### M5 — Hot follower (local-copy)
+### M5 — Hot follower (local-copy) — DONE (basic)
+`Follower` is implemented: poll the bucket, restore a newer version into a fresh local dir, open it
+read-only, atomically swap the handle `database()` hands out (keeping the previous dir one generation
+as a reader grace window). Proven by `tests/follower_e2e.rs` (catches up, serves reads via iteration,
+advances on new versions, no-ops when current). Deferred: the VFS / lazy-block variant and a hardened
+reader-grace/refcount story (see ROADMAP).
+
+Original plan (for reference):
 - `Follower::poll_once`: find newest version (`resolve_version(Latest)`), download only missing
   files, verify checksums, open a read-only `fjall::Database` at the new file set, **atomically swap**
   the handle readers use (in-flight reads finish on the old version — CoW safe).

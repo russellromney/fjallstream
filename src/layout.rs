@@ -3,10 +3,9 @@
 //!
 //! ```text
 //! <db>/generations/<gen>/
-//!     files/<file-id>            immutable SSTs + blobs, uploaded once
-//!     versions/<seqno>.json      incremental version records
-//!     snapshots/<seqno>.json     version records flagged as full re-base points
-//!     journal/<from>-<to>.seg    journal tail per version
+//!     files/<relpath>            immutable files (SSTs, blobs, manifests), keyed by db-relative path
+//!     journals/<seqno>/<name>    per-version journal files (mutable, not content-addressed)
+//!     versions/<seqno>.json      version records (each self-contained — a full file set)
 //! ```
 
 use crate::types::{FileId, Generation};
@@ -42,14 +41,15 @@ impl Layout {
         format!("{}/versions", self.base())
     }
 
-    pub fn snapshot(&self, seqno: u64) -> String {
-        format!("{}/snapshots/{:020}.json", self.base(), seqno)
-    }
-
     /// A journal file for one version. Journals are mutable (rewritten in place), so they are keyed
     /// per-version rather than content-addressed — each capture ships its own copy.
     pub fn journal(&self, seqno: u64, name: &str) -> String {
         format!("{}/journals/{:020}/{}", self.base(), seqno, name)
+    }
+
+    /// The prefix under which a version's journals live, for pruning.
+    pub fn journals_prefix(&self, seqno: u64) -> String {
+        format!("{}/journals/{:020}", self.base(), seqno)
     }
 
     /// Parse a `versions/<seqno>.json` key back to its seqno. Returns `None` if the key isn't a

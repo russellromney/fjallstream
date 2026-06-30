@@ -150,33 +150,18 @@ async fn corrupted_file_is_detected_not_silently_served() {
     }
     assert!(corrupted > 0, "expected at least one table file to corrupt");
 
-    restore_to(&store, &layout, RestoreTarget::Latest, dst.path()).await.unwrap();
-
-    // Open + read everything. fjall's XXH3 checksums must surface the corruption: either open fails,
-    // or a read errors. The one thing that must NOT happen is silently returning wrong/missing data
-    // as if it were correct.
-    let detected = match Database::builder(dst.path()).open() {
-        Err(_) => true,
-        Ok(db) => {
-            let ks = db.keyspace("data", KeyspaceCreateOptions::default).unwrap();
-            let mut bad = false;
-            for i in 0..2_000u32 {
-                match ks.get(format!("k{i:06}")) {
-                    Err(_) => {
-                        bad = true;
-                        break;
-                    }
-                    Ok(v) if v.as_deref() != Some(format!("v{i:06}").as_bytes()) => {
-                        bad = true;
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-            }
-            bad
-        }
-    };
-    assert!(detected, "corruption must be detected (open or read error), never silently served");
+    // fjallstream's own content hashes must catch it at restore — loudly, before fjall ever opens
+    // the db — never silently writing corrupt bytes into the restored tree.
+    let err = restore_to(&store, &layout, RestoreTarget::Latest, dst.path()).await;
+    assert!(
+        matches!(err, Err(fjallstream::Error::ChecksumMismatch(_))),
+        "corruption must be caught at restore as ChecksumMismatch, got {err:?}"
+    );
+    // And the target must not have been left half-built.
+    assert!(
+        !dst.path().join("version").exists(),
+        "a failed restore must not leave a partial database"
+    );
 }
 
 // ---- C6: the keyspace-set guard fires under concurrent keyspace creation ----

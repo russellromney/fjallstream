@@ -4,15 +4,24 @@ Post-0.1-core work, deferred deliberately. The 0.1 core (capture → replicate �
 backend) and its correctness fixes land first (see `PLAN.md`). These are the items we chose *not* to
 solve in the local path, with the reason. Each tag (C#/P#) maps to a bugaboo from the design review.
 
+## Done since the review
+
+- **C5 — `ObjectStore::list` contract.** Resolved: `list` is now recursive (flat keys) on both Local
+  and Mem, pinned by `tests/conformance.rs`.
+- **C3 — seqno semantics.** Resolved enough: the recorded seqno is now an honest upper bound
+  (`db.seqno()` read after the journal), so restore-at-or-before is conservative-but-correct. Verified
+  by `tests/consistency.rs`. (A *tighter* seqno still wants a fjall flushed-high-water API — minor.)
+- **`prune` + retention** — implemented (`tests/prune.rs`).
+- **Local-copy hot follower** — implemented (`tests/follower_e2e.rs`).
+- **Checksums on restore** — implemented (FNV-1a per file/journal, `ChecksumMismatch`).
+- **MemObjectStore + conformance suite** — implemented.
+
 ## Land with S3 integration
 
-These only matter once a high-latency, network backend exists, or are best solved as part of making
-two backends agree. Build them in the S3 milestone, not before.
+These only matter once a high-latency, network backend exists. Build them in the S3 milestone.
 
-- **C5 — `ObjectStore::list` contract.** `LocalObjectStore::list` is currently shallow (one
-  `read_dir`); S3 prefix-list is recursive. Pin the trait contract (recursive, flat keys), fix Local
-  to match, and lock it with the shared conformance suite. Required before `prune` can enumerate
-  `files/` correctly on both backends.
+- **`S3ObjectStore`** (feature `s3`) speaking S3/Tigris, + conformance run against real Tigris via the
+  `FJALLSTREAM_E2E=tigris` gate.
 - **P1 — Parallel uploads.** `replicate_once` uploads files one `await` at a time — fine on local
   disk, brutal on S3 (one RTT per file). `buffer_unordered(16–32)` the file puts; still write the
   version record last, after the join.
@@ -28,10 +37,6 @@ two backends agree. Build them in the S3 milestone, not before.
 
 Not S3-specific, but bigger than the 0.1 core or blocked on a fjall API we don't have.
 
-- **C3 — Precise durable seqno.** Today the recorded version seqno is an upper bound: writes in the
-  flush→snapshot window aren't in the shipped SSTs. Record the exact flushed high-water instead.
-  Likely needs a fjall API to read per-keyspace flushed seqno (internal today). Until then, 0.1
-  documents the seqno as an upper bound and restore lands at-or-before it.
 - **C4 — Cross-keyspace consistent cut.** 0.1 guarantees per-keyspace crash-consistency only;
   sequential per-keyspace flush + file capture can tear a cross-keyspace transaction. A true single
   cut needs either atomic multi-keyspace flush or capturing through the snapshot's view (no public
@@ -45,10 +50,12 @@ Not S3-specific, but bigger than the 0.1 core or blocked on a fjall API we don't
 
 ## Bigger bets (already noted in PLAN.md "Open decisions" / "Deferred")
 
-- Hot follower hardening: VFS / lazy-block reads (Litestream v0.5 style) vs. local-copy.
+- Hot follower hardening: VFS / lazy-block reads (Litestream v0.5 style); a refcount/grace story so a
+  reader holding `database()` across two polls can't have its directory removed.
 - Promotion / failover with generation fencing (split-brain protection).
-- `prune` + retention-window GC of superseded files.
 - A `fjallstream` CLI for disaster recovery (`restore`, `generations`, `status`).
+- `run()` resilience: it currently returns on the first error (caller restarts); add backoff/retry +
+  an observability surface so transient store failures don't end the loop.
 - Journal-tail streaming for sub-flush RPO (needs partial-journal replay-to-seqno).
 - Journal shipping optimization: per-version journals are gzip-compressed (~64 MiB of zeros → a few
   hundred KB), but still shipped every version. Could content-hash to dedup unchanged journals, or

@@ -1,7 +1,9 @@
 //! Cold reader. Reconstructs a local database directory at a chosen point in time.
 //!
-//! Restore is just "replicate, run backward once": pick the newest version record at or before the
-//! target, download its files, and (TODO) replay the journal tail to the exact seqno.
+//! Restore picks the newest version record at or before the target, downloads its files + journals
+//! (verifying each against the content hash in the record), lays the tree into a staging directory,
+//! fsyncs, and atomically renames it into place. Opening the result recovers the database — the
+//! journals carry the seqno watermark, so iterators/snapshots work, not just point gets.
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
@@ -52,11 +54,9 @@ async fn newest_matching<S: ObjectStore>(
     Ok(None)
 }
 
-/// Restore the database to `dst`: download every file the resolved version references, verifying
-/// each before it lands.
-///
-/// TODO: after downloading files, replay the journal segment referenced by the record up to the
-/// target seqno so `dst` opens at the exact point. Also verify SFA XXH3 checksums on each file.
+/// Restore the database to `dst`: download every file + journal the resolved version references,
+/// verifying each against the content hash in the record before it lands, then atomically install.
+/// Refuses a non-empty `dst`.
 pub async fn restore_to<S: ObjectStore>(
     store: &S,
     layout: &Layout,
@@ -74,12 +74,29 @@ pub async fn restore_to<S: ObjectStore>(
     }
 
     // Build the whole tree in a sibling staging dir, fsync it, then atomically rename into place.
-    // A crash before the rename leaves `dst` absent or untouched — never half-built. (C2)
+    // A crash (or error) before the rename leaves `dst` absent or untouched — never half-built. (C2)
     let staging = staging_path(dst)?;
     let _ = tokio::fs::remove_dir_all(&staging).await; // clear any leftover from a prior crash
-    tokio::fs::create_dir_all(&staging)
+    match restore_staged(store, layout, &record, &staging, dst).await {
+        Ok(()) => Ok(record),
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&staging).await; // don't leak partial staging on failure
+            Err(e)
+        }
+    }
+}
+
+/// Populate `staging`, fsync it, and atomically rename it onto `dst`.
+async fn restore_staged<S: ObjectStore>(
+    store: &S,
+    layout: &Layout,
+    record: &VersionRecord,
+    staging: &Path,
+    dst: &Path,
+) -> Result<()> {
+    tokio::fs::create_dir_all(staging)
         .await
-        .map_err(|source| Error::Io { path: staging.clone(), source })?;
+        .map_err(|source| Error::Io { path: staging.to_path_buf(), source })?;
 
     // Recreate every directory, including empty ones (e.g. a fresh keyspace's `tables/`, which
     // fjall's recovery does not create).
@@ -90,28 +107,34 @@ pub async fn restore_to<S: ObjectStore>(
             .map_err(|source| Error::Io { path: p, source })?;
     }
 
-    // Immutable files, by relative path.
-    for id in &record.file_ids {
+    // Immutable files, by relative path. Verify each against its recorded content hash before it
+    // lands — bucket corruption fails loudly here, not silently when fjall later reads a bad block.
+    for (i, id) in record.file_ids.iter().enumerate() {
         let bytes = store.get(&layout.file(id)).await?;
-        write_file(&staging, &id.0, &bytes).await?;
+        verify(&bytes, record.file_checksums.get(i), &id.0)?;
+        write_file(staging, &id.0, &bytes).await?;
     }
 
     // Journals, keyed per-version (gzip-compressed). Required for recovery to restore the seqno
     // watermark — without them the restored db has visible_seqno 0 and iterators see nothing.
-    for name in &record.journals {
+    for (i, name) in record.journals.iter().enumerate() {
         let compressed = store.get(&layout.journal(record.seqno, name)).await?;
         let bytes = crate::compress::gunzip(&compressed)?;
-        write_file(&staging, name, &bytes).await?;
+        verify(&bytes, record.journal_checksums.get(i), name)?;
+        write_file(staging, name, &bytes).await?;
     }
 
     // Mutable pointer files (each keyspace's `current` HEAD), captured inline in the record.
     for p in &record.pointers {
-        write_file(&staging, &p.path, &p.bytes).await?;
+        write_file(staging, &p.path, &p.bytes).await?;
     }
 
     // fjall's recovery acquires the lock file with open (not create), so it must pre-exist. It's a
     // 0-byte runtime artifact we deliberately don't replicate — recreate an empty one here.
-    write_file(&staging, "lock", b"").await?;
+    write_file(staging, "lock", b"").await?;
+
+    // Make the staged tree durable before the rename.
+    fsync_dir(staging).await;
 
     // Swap staging into place. `dst` is empty (checked above), so removing it is safe.
     if tokio::fs::try_exists(dst).await.unwrap_or(false) {
@@ -119,11 +142,34 @@ pub async fn restore_to<S: ObjectStore>(
             .await
             .map_err(|source| Error::Io { path: dst.to_path_buf(), source })?;
     }
-    tokio::fs::rename(&staging, dst)
+    tokio::fs::rename(staging, dst)
         .await
         .map_err(|source| Error::Io { path: dst.to_path_buf(), source })?;
+    // Make the rename itself durable.
+    if let Some(parent) = dst.parent() {
+        fsync_dir(parent).await;
+    }
 
-    Ok(record)
+    Ok(())
+}
+
+/// Fail loudly if `bytes` don't match the expected content hash. A missing expected hash (old record)
+/// skips verification.
+fn verify(bytes: &[u8], expected: Option<&u64>, name: &str) -> Result<()> {
+    if let Some(&expected) = expected {
+        if crate::checksum::hash64(bytes) != expected {
+            return Err(Error::ChecksumMismatch(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// fsync a directory so a rename/creation in it is durable. Best-effort: directory fsync isn't
+/// portable (Windows), and the per-file fsync already covers the data.
+async fn fsync_dir(dir: &Path) {
+    if let Ok(f) = tokio::fs::File::open(dir).await {
+        let _ = f.sync_all().await;
+    }
 }
 
 /// True if `dir` exists and contains at least one entry. A missing dir is "empty".

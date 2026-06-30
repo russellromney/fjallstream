@@ -22,12 +22,7 @@ pub enum Error {
     #[error("fjall: {0}")]
     Fjall(String),
 
-    /// The requested cursor has aged out of the retention window; the reader must
-    /// re-bootstrap from a full snapshot.
-    #[error("cursor {0} is outside the retention window; re-bootstrap required")]
-    OutsideRetention(u64),
-
-    #[error("checksum mismatch for file {0}")]
+    #[error("checksum mismatch for {0}")]
     ChecksumMismatch(String),
 }
 

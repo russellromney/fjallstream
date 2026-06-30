@@ -9,6 +9,7 @@
 //! SQLite's mutable pages.
 
 pub mod capture;
+mod checksum;
 mod compress;
 pub mod error;
 pub mod follower;
@@ -20,6 +21,7 @@ pub mod types;
 
 pub use capture::{capture, Captured};
 pub use error::{Error, Result};
-pub use object_store::{LocalObjectStore, ObjectStore};
+pub use follower::{FollowConfig, Follower};
+pub use object_store::{LocalObjectStore, MemObjectStore, ObjectStore};
 pub use replicator::{LocalVersion, ReplicateConfig, Replicator};
-pub use types::{Cursor, FileId, Generation, PointerFile, RestoreTarget, VersionRecord};
+pub use types::{FileId, Generation, PointerFile, RestoreTarget, VersionRecord};

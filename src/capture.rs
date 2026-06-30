@@ -2,11 +2,12 @@
 //! only module that touches fjall. Verified against fjall 3.1.5 (see `examples/spike_layout.rs`).
 //!
 //! Strategy (DESIGN.md "Capture strategy"):
-//!   1. `rotate_memtable_and_wait()` on each keyspace — push committed data out of the journal into
-//!      immutable SSTs, so the captured set is complete without shipping the 64 MiB journal.
-//!   2. `db.snapshot()` — pin GC so nothing we're about to read is deleted under us.
+//!   1. `rotate_memtable_and_wait()` on each keyspace — push committed data into immutable SSTs,
+//!      minimizing the journal's live content (we still ship the journal; it carries the seqno).
+//!   2. `db.snapshot()` — pin SST GC so nothing we're about to read is deleted under us.
 //!   3. Walk the db dir: immutable files become content-addressed `files`; the per-keyspace
-//!      `current` HEAD pointers are captured inline; `*.jnl` and `lock` are skipped.
+//!      `current` HEAD pointers are captured inline; `*.jnl` are captured as per-version journals
+//!      (read consistently, since they race background maintenance); `lock` is skipped.
 //!
 //! The returned [`Captured`] holds the snapshot, so GC stays pinned until the caller has finished
 //! uploading and drops it.
@@ -58,7 +59,6 @@ pub fn capture(
     for attempt in 0..CAPTURE_RETRIES {
         // Pin GC. Held inside `Captured` until the caller drops it.
         let snapshot = db.snapshot();
-        let seqno: u64 = snapshot.seqno();
 
         // Watch the keyspace set: a keyspace created or dropped mid-walk would be captured torn,
         // and the pointer check wouldn't catch it (its `current` isn't in our list yet).
@@ -85,6 +85,11 @@ pub fn capture(
         // (rotation/truncation), which would ship a torn journal that won't recover.
         if db.keyspace_count() == keyspaces_before && pointers_unchanged(db_path, &pointers)? {
             if let Some(journal_bytes) = read_journals_stable(db_path, &journals)? {
+                // Record an upper-bound seqno read *after* the journal: `db.seqno()` is the next
+                // sequence number, so it exceeds every write the journal contains. This makes the
+                // recorded seqno an honest upper bound — `restore at-or-before X` then never returns
+                // content past X, even when writes land concurrently during capture.
+                let seqno: u64 = db.seqno();
                 let version =
                     LocalVersion { seqno, parent, files, dirs, journals: journal_bytes, pointers };
                 return Ok(Captured { version, retries: attempt as u32, _snapshot: snapshot });
