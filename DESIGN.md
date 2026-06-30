@@ -102,6 +102,22 @@ needs a way to replay a partial journal up to a seqno that fjall's public API do
   A follower must never pin the writer's GC indefinitely.
 - **Generations.** A restore-and-diverge starts a new generation id so histories never cross.
 
+## Consistency guarantees (0.1)
+
+What a restore actually promises, and the limits we accept for now:
+
+- **Per-keyspace crash-consistency, not a cross-keyspace transactional cut.** Capture flushes each
+  keyspace then takes one snapshot; a transaction spanning keyspaces can land on different sides of
+  the cut. Single-keyspace restores are crash-consistent. A true cross-keyspace cut is roadmap (C4).
+- **The version seqno is an upper bound.** Writes in the flush→snapshot window aren't in the shipped
+  SSTs, so "restore to seqno S" lands *at or before* S. Recording the exact durable seqno needs a
+  fjall API we don't have yet (roadmap, C3).
+- **Restore is atomic and won't clobber.** It stages into a sibling dir, fsyncs, and renames into
+  place; it refuses a non-empty target. A crash leaves the target absent or complete, never torn.
+- **RPO = capture interval; don't capture sub-second.** Each capture force-flushes a memtable
+  (`rotate_memtable_and_wait`), creating an L0 SST. Capturing too often hammers the source LSM with
+  compaction. Skipping the flush when nothing changed is roadmap (P3).
+
 ## fjall on-disk layout (3.x, verified)
 
 Inspected against fjall 3.1.5 (`examples/spike_layout.rs`). A database is a **directory tree**, not a

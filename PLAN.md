@@ -36,8 +36,14 @@ relative path, `VersionRecord` carries inline `pointers`, restore recreates the 
 decisive M3 round-trip (write → capture → replicate → restore → **open → read every key back**) passes
 against real fjall 3.1.5 — no journal shipped, meta keyspace intact. Two findings folded in: capture
 retries if compaction moves `current` mid-walk; restore must recreate the `lock` file (fjall opens it
-without creating). Still TODO at this layer: a *stress* test that captures under continuous concurrent
-writes/compaction (the consistency guard exists but isn't yet hammered).
+without creating).
+
+**Correctness hardening done** (the review's "fix now" set): C1 dead-file tolerance (drop files GC'd
+mid-upload), C6 keyspace-set stability + empty-directory replication, C7 monotonic timestamps, C2
+atomic non-clobbering restore (stage → fsync → rename). C3/C4/P3 are stated as guarantees in
+DESIGN.md "Consistency guarantees"; their full fixes live in ROADMAP.md. Proven by `tests/stress.rs`
+(20 capture→restore→open cycles under a concurrent write flood + compaction) and
+`tests/multi_keyspace.rs` (two keyspaces incl. an empty one).
 
 Original plan (for reference):
 - `capture(db, db_path, keyspaces) -> LocalVersion` (see DESIGN.md "Capture strategy"):

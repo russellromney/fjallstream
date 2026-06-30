@@ -32,6 +32,8 @@ pub struct LocalVersion {
     pub parent: Option<u64>,
     /// Every immutable file the database references right now, as `(file id, path on disk)`.
     pub files: Vec<(FileId, PathBuf)>,
+    /// Relative paths of every directory in the db tree (so restore can recreate empty ones).
+    pub dirs: Vec<String>,
     /// The mutable pointer files (each keyspace's `current` HEAD), captured by value.
     pub pointers: Vec<PointerFile>,
 }
@@ -63,11 +65,14 @@ pub struct Replicator<S: ObjectStore> {
     layout: Layout,
     cfg: ReplicateConfig,
     versions_since_snapshot: u64,
+    /// Last `ts_millis` we wrote, so version timestamps stay monotonic even if the wall clock steps
+    /// backwards (NTP). Time-based restore targets rely on this.
+    last_ts_millis: u64,
 }
 
 impl<S: ObjectStore> Replicator<S> {
     pub fn new(store: S, layout: Layout, cfg: ReplicateConfig) -> Self {
-        Self { store, layout, cfg, versions_since_snapshot: 0 }
+        Self { store, layout, cfg, versions_since_snapshot: 0, last_ts_millis: 0 }
     }
 
     /// Replicate one captured version: upload its not-yet-present files, ship its journal tail, and
@@ -76,16 +81,24 @@ impl<S: ObjectStore> Replicator<S> {
     /// Idempotent on files (immutable => skip if already present). Writing the version record last
     /// means a crash mid-upload leaves an unreferenced partial file set, never a dangling record.
     pub async fn replicate_once(&mut self, version: &LocalVersion) -> Result<u64> {
-        // 1. Upload immutable files we don't already have.
+        // 1. Upload immutable files we don't already have. A file that vanished between capture and
+        //    now (obsolete, GC'd after a compaction) is dropped from the record: the held snapshot
+        //    pins everything reachable from `current`, so anything that disappeared was not part of
+        //    the live set and is safe to omit. (C1)
+        let mut present_ids = Vec::with_capacity(version.files.len());
         for (id, path) in &version.files {
             let key = self.layout.file(id);
             if self.store.exists(&key).await? {
+                present_ids.push(id.clone());
                 continue;
             }
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|source| crate::error::Error::Io { path: path.clone(), source })?;
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(crate::error::Error::Io { path: path.clone(), source }),
+            };
             self.store.put(&key, Bytes::from(bytes)).await?;
+            present_ids.push(id.clone());
         }
 
         // 2. Decide whether this is a forced re-base point.
@@ -93,15 +106,19 @@ impl<S: ObjectStore> Replicator<S> {
             matches!(self.cfg.snapshot_every, Some(n) if self.versions_since_snapshot + 1 >= n);
 
         // 3. Write the version record last (the commit point). The mutable pointer files ride
-        //    inline; there is no journal in 0.1 (capture force-flushes first).
-        let ts_millis = SystemTime::now()
+        //    inline; there is no journal in 0.1 (capture force-flushes first). The timestamp is kept
+        //    monotonic across versions so a backward clock step can't reorder time-based restore. (C7)
+        let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let ts_millis = now_millis.max(self.last_ts_millis.saturating_add(1));
+        self.last_ts_millis = ts_millis;
         let record = VersionRecord {
             seqno: version.seqno,
             parent: version.parent,
-            file_ids: version.files.iter().map(|(id, _)| id.clone()).collect(),
+            file_ids: present_ids,
+            dirs: version.dirs.clone(),
             pointers: version.pointers.clone(),
             is_snapshot,
             ts_millis,

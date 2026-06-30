@@ -57,17 +57,23 @@ pub fn capture(
         let snapshot = db.snapshot();
         let seqno: u64 = snapshot.seqno();
 
-        // Walk the directory into immutable files + inline pointer files.
-        let mut files = Vec::new();
-        let mut pointers = Vec::new();
-        walk(db_path, db_path, &mut files, &mut pointers)?;
+        // Watch the keyspace set: a keyspace created or dropped mid-walk would be captured torn,
+        // and the pointer check wouldn't catch it (its `current` isn't in our list yet).
+        let keyspaces_before = db.keyspace_count();
 
-        // Verify the manifest was stable across the walk.
-        if pointers_unchanged(db_path, &pointers)? {
-            let version = LocalVersion { seqno, parent, files, pointers };
+        // Walk the directory into immutable files, directories, and inline pointer files.
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        let mut pointers = Vec::new();
+        walk(db_path, db_path, &mut files, &mut dirs, &mut pointers)?;
+
+        // Consistent iff the manifest was stable (no `current` moved) AND the keyspace set didn't
+        // change across the walk.
+        if db.keyspace_count() == keyspaces_before && pointers_unchanged(db_path, &pointers)? {
+            let version = LocalVersion { seqno, parent, files, dirs, pointers };
             return Ok(Captured { version, _snapshot: snapshot });
         }
-        // `current` moved under us — drop the snapshot and try again.
+        // Something moved under us — drop the snapshot and try again.
         drop(snapshot);
     }
 
@@ -94,6 +100,7 @@ fn walk(
     base: &Path,
     dir: &Path,
     files: &mut Vec<(FileId, std::path::PathBuf)>,
+    dirs: &mut Vec<String>,
     pointers: &mut Vec<PointerFile>,
 ) -> Result<()> {
     let rd = std::fs::read_dir(dir).map_err(|source| Error::Io { path: dir.to_path_buf(), source })?;
@@ -103,17 +110,19 @@ fn walk(
         let ft = entry
             .file_type()
             .map_err(|source| Error::Io { path: path.clone(), source })?;
-        if ft.is_dir() {
-            walk(base, &path, files, pointers)?;
-            continue;
-        }
 
-        // Relative path with forward slashes, used as the file id / pointer path.
+        // Relative path with forward slashes, used as the file id / dir / pointer path.
         let rel = path
             .strip_prefix(base)
             .expect("walked path is under base")
             .to_string_lossy()
             .replace('\\', "/");
+
+        if ft.is_dir() {
+            dirs.push(rel);
+            walk(base, &path, files, dirs, pointers)?;
+            continue;
+        }
 
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 

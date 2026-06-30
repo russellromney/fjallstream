@@ -37,6 +37,10 @@ pub struct VersionRecord {
     pub parent: Option<u64>,
     /// Every immutable file the database references at this version (keyed by relative path).
     pub file_ids: Vec<FileId>,
+    /// Relative paths of every directory in the database tree, so restore can recreate empty ones
+    /// (e.g. a freshly created keyspace's `tables/`, which fjall's recovery does not create).
+    #[serde(default)]
+    pub dirs: Vec<String>,
     /// The mutable pointer files (e.g. each keyspace's `current` HEAD), captured inline.
     pub pointers: Vec<PointerFile>,
     /// True if this record is a full re-base point (a fresh snapshot) rather than an incremental
